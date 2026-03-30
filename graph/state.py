@@ -170,6 +170,10 @@ class ResearchAgentState(TypedDict):
     # --- Research (reducer required for Send fan-out) ---
     worker_results: Annotated[list[WorkerResult], operator.add]
 
+    # --- Post-compression (set by boundary_compressor, read by coordinator) ---
+    # operator.add cannot be "replaced", so boundary_compressor writes here instead.
+    compressed_worker_results: list[WorkerResult]
+
     # --- Synthesis ---
     synthesis: Optional[SynthesisOutput]
     grounding_issues: list[str]  # populated by grounding_check node

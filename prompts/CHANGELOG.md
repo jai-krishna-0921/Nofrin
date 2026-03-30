@@ -5,15 +5,15 @@
 ---
 
 ## supervisor_v1.txt
-- **Date**: project start
-- **What**: Initial intent classification + query decomposition
-- **Why**: Baseline
+- **Date**: 2026-03-29
+- **What**: Initial intent classification + query decomposition. Two-step prompt: classify intent (4 types with examples), then generate 3-5 sub-queries with source routing (web/academic/news).
+- **Why**: Baseline — first implementation
 - **Eval delta**: N/A (baseline)
 
 ## worker_v1.txt
-- **Date**: project start
-- **What**: Evidence extraction with structured JSON output
-- **Why**: Baseline
+- **Date**: 2026-03-29
+- **What**: Evidence extraction prompt. LLM extracts one claim + supporting chunks per Exa result. Returns confidence (0–1) and contradiction_score (0–1). Empty claim sentinel for "no relevant evidence" case.
+- **Why**: Baseline — first implementation
 - **Eval delta**: N/A (baseline)
 
 ## coordinator_v1.txt

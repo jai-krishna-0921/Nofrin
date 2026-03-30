@@ -26,7 +26,7 @@ pydantic==2.12.5
 orjson==3.11.7
 
 # ── Search (Phase 1+) ─────────────────────────────────────────────────────────
-# exa-py          # uncomment when tools/exa_search.py is implemented
+exa-py           # AsyncExa used in agents/worker.py
 
 # ── Dev tooling ───────────────────────────────────────────────────────────────
 pytest==9.0.2

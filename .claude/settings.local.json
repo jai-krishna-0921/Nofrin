@@ -2,7 +2,22 @@
   "permissions": {
     "allow": [
       "mcp__context7__query-docs",
-      "mcp__sequential-thinking__sequentialthinking"
+      "mcp__sequential-thinking__sequentialthinking",
+      "Bash(source venv/bin/activate)",
+      "Bash(python -m pytest tests/test_supervisor.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_supervisor.py::test_supervisor_retries_on_parse_failure -v -s)",
+      "Bash(python -m pytest tests/test_supervisor.py -v --tb=short --durations=5)",
+      "Bash(python -m pytest tests/ -v)",
+      "WebSearch",
+      "mcp__context7__resolve-library-id",
+      "Bash(pip install:*)",
+      "Bash(python -c \"from exa_py import AsyncExa; print\\(''AsyncExa OK''\\); from exa_py import Exa; print\\(''Exa OK''\\)\")",
+      "Bash(mypy agents/worker.py graph/context.py --strict)",
+      "Bash(pytest tests/test_worker.py -v)",
+      "Bash(pytest tests/ -v)",
+      "Bash(mypy graph/state.py graph/boundary_compressor.py graph/router.py graph/builder.py agents/supervisor.py agents/worker.py --strict)",
+      "Bash(python -c \"import langchain_anthropic; print\\(langchain_anthropic.__file__\\)\")",
+      "Bash(mypy graph/router.py --strict)"
     ]
   }
 }
