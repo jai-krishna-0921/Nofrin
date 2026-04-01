@@ -121,8 +121,8 @@ def test_compressor_multiple_workers() -> None:
     """3 worker results each compressed independently; lengths correct."""
     workers = [
         make_worker_result([0.9, 0.8, 0.7, 0.6, 0.5, 0.4], worker_id="w1"),  # 6 → 5
-        make_worker_result([0.9, 0.8], worker_id="w2"),                        # 2 → 2
-        make_worker_result([], worker_id="w3"),                                 # 0 → 0
+        make_worker_result([0.9, 0.8], worker_id="w2"),  # 2 → 2
+        make_worker_result([], worker_id="w3"),  # 0 → 0
     ]
     compressed = compress_worker_results(workers)
 

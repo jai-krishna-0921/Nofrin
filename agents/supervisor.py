@@ -46,6 +46,7 @@ def _is_anthropic(llm: BaseChatModel) -> bool:
     except ImportError:
         return False
 
+
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "supervisor_v1.txt"
 
 _VALID_INTENT_TYPES: frozenset[str] = frozenset(

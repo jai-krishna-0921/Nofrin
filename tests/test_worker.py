@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agents.worker import (
-    _RawEvidenceExtraction,
     _build_exa_params_academic,
     _build_exa_params_news,
     _build_exa_params_web,
@@ -290,9 +289,7 @@ async def test_partial_failure_skips_one_returns_others() -> None:
 async def test_all_results_fail_returns_empty_evidence() -> None:
     """All extractions fail → evidence_items == [], tokens == 0."""
 
-    async def mock_extract(
-        *args: object, **kwargs: object
-    ) -> tuple[Evidence, int]:
+    async def mock_extract(*args: object, **kwargs: object) -> tuple[Evidence, int]:
         raise AgentParseError("forced failure")
 
     with patch("agents.worker._extract_evidence_from_result", side_effect=mock_extract):

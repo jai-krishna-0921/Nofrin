@@ -46,6 +46,7 @@ def _is_anthropic(llm: BaseChatModel) -> bool:
     except ImportError:
         return False
 
+
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "worker_v1.txt"
 
@@ -369,9 +370,7 @@ async def _extract_all_evidence(
     ]
 
     raw_outcomes = await asyncio.gather(*coros, return_exceptions=True)
-    outcomes = cast(
-        list[tuple[Evidence, int] | BaseException], list(raw_outcomes)
-    )
+    outcomes = cast(list[tuple[Evidence, int] | BaseException], list(raw_outcomes))
 
     evidence_items: list[Evidence] = []
     total_tokens = 0

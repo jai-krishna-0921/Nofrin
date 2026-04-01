@@ -17,7 +17,25 @@
       "Bash(pytest tests/ -v)",
       "Bash(mypy graph/state.py graph/boundary_compressor.py graph/router.py graph/builder.py agents/supervisor.py agents/worker.py --strict)",
       "Bash(python -c \"import langchain_anthropic; print\\(langchain_anthropic.__file__\\)\")",
-      "Bash(mypy graph/router.py --strict)"
+      "Bash(mypy graph/router.py --strict)",
+      "Bash(mypy agents/coordinator.py --strict)",
+      "Bash(mypy agents/__init__.py graph/builder.py --strict)",
+      "Bash(python -c \"from agents.coordinator import coordinator_node; print\\(''coordinator import OK''\\)\")",
+      "Bash(ls:*)",
+      "Bash(pytest tests/test_coordinator.py -v)",
+      "Bash(ruff check:*)",
+      "Bash(ruff format:*)",
+      "Bash(pytest eval/ -v)",
+      "Bash(python -m mypy agents/coordinator.py graph/builder.py graph/router.py --strict)",
+      "Bash(python -m mypy tests/test_coordinator.py --strict)",
+      "Bash(mypy tests/test_coordinator.py --strict)",
+      "Bash(mypy agents/grounding_check.py --strict)",
+      "Bash(pytest tests/test_grounding_check.py -v)",
+      "Bash(mypy tests/test_grounding_check.py --strict)",
+      "Bash(pytest tests/test_grounding_check.py -v --co -q)",
+      "Bash(pytest tests/test_grounding_check.py --collect-only -q)",
+      "Bash(pytest tests/ -v --tb=short)",
+      "Bash(python:*)"
     ]
   }
 }

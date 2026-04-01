@@ -10,8 +10,7 @@ validation logic, retry behavior, and prompt loading.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -518,7 +517,9 @@ def test_load_prompt_missing_file_raises() -> None:
 
 def test_build_messages_anthropic_has_cache_control() -> None:
     """use_cache_control=True → SystemMessage content is list with cache_control block."""
-    msgs = _build_messages("test query", "static prompt template", use_cache_control=True)
+    msgs = _build_messages(
+        "test query", "static prompt template", use_cache_control=True
+    )
 
     assert len(msgs) == 1
     content = msgs[0].content
@@ -539,7 +540,9 @@ def test_build_messages_anthropic_has_cache_control() -> None:
 
 def test_build_messages_groq_no_cache_control() -> None:
     """use_cache_control=False (groq/ollama/openrouter) → plain string SystemMessage."""
-    msgs = _build_messages("my question", "prompt with {{user_query}} here", use_cache_control=False)
+    msgs = _build_messages(
+        "my question", "prompt with {{user_query}} here", use_cache_control=False
+    )
 
     assert len(msgs) == 1
     content = msgs[0].content

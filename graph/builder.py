@@ -3,8 +3,8 @@ graph/builder.py
 
 LangGraph workflow assembly for the Deep Research Agent.
 
-Current wiring (Phase 1 — nodes implemented so far):
-  START → supervisor → boundary_compressor → END
+Current wiring (Phase 3 — nodes implemented so far):
+  START → supervisor → boundary_compressor → coordinator → grounding_check → END
 
 Planned full wiring (Phase 1 complete):
   START → supervisor
@@ -67,33 +67,35 @@ def build_graph() -> CompiledStateGraph:  # type: ignore[type-arg]
 
     # ── Nodes (import here to avoid circular imports as agent package grows) ─
 
+    from agents.coordinator import coordinator_node
+    from agents.grounding_check import grounding_check_node
     from agents.supervisor import supervisor_node
     from graph.boundary_compressor import boundary_compressor_node
     from graph.router import budget_gate_node
 
     builder.add_node("supervisor", supervisor_node)  # type: ignore[call-overload]
     builder.add_node("boundary_compressor", boundary_compressor_node)
+    builder.add_node("coordinator", coordinator_node)  # type: ignore[arg-type]
+    builder.add_node("grounding_check", grounding_check_node)  # type: ignore[arg-type]
     builder.add_node("budget_gate", budget_gate_node)  # type: ignore[arg-type]
 
     # TODO: add as implemented
     # from agents.worker import worker_node
-    # from agents.coordinator import coordinator_node
-    # from agents.grounding_check import grounding_check_node
     # from agents.critic import critic_node
     # from agents.delivery import delivery_node
     # from graph.router import route_after_critic
     #
     # builder.add_node("worker", worker_node, cache_policy=CachePolicy(ttl=300))
-    # builder.add_node("coordinator", coordinator_node)
-    # builder.add_node("grounding_check", grounding_check_node)
     # builder.add_node("critic", critic_node)
     # builder.add_node("delivery", delivery_node)
 
-    # ── Edges (Phase 1 partial — extend as nodes are added) ──────────────────
+    # ── Edges (Phase 3 partial — extend as nodes are added) ──────────────────
 
     builder.add_edge(START, "supervisor")
     builder.add_edge("supervisor", "boundary_compressor")
-    builder.add_edge("boundary_compressor", END)
+    builder.add_edge("boundary_compressor", "coordinator")
+    builder.add_edge("coordinator", "grounding_check")
+    builder.add_edge("grounding_check", END)
 
     # TODO: full linear wiring once all nodes exist
     # Phase 2: replace supervisor→worker edge with Send() fan-out dispatcher:

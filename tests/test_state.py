@@ -10,7 +10,6 @@ No mocking required — these are pure data types.
 import operator
 from typing import get_type_hints
 
-import pytest
 
 from graph.state import (
     Evidence,
@@ -48,7 +47,10 @@ def test_evidence_construction():
 
     assert evidence.claim == "Python was created by Guido van Rossum"
     assert len(evidence.supporting_chunks) == 1
-    assert evidence.supporting_chunks[0] == "Guido van Rossum began working on Python in 1989"
+    assert (
+        evidence.supporting_chunks[0]
+        == "Guido van Rossum began working on Python in 1989"
+    )
     assert evidence.source_url == "https://example.com/python-history"
     assert evidence.source_title == "The History of Python"
     assert evidence.published_date == "2023-01-15"
@@ -137,14 +139,16 @@ def test_worker_result_construction():
     assert worker_result.source_type == "web"
     assert len(worker_result.evidence_items) == 2
     assert worker_result.evidence_items[0].claim == "Python 3.0 was released in 2008"
-    assert worker_result.evidence_items[1].claim == "Python 2 reached end-of-life in 2020"
+    assert (
+        worker_result.evidence_items[1].claim == "Python 2 reached end-of-life in 2020"
+    )
     assert len(worker_result.raw_search_results) == 2
     assert worker_result.tokens_used == 1500
 
 
 def test_synthesis_output_construction():
     """Construct a SynthesisOutput with findings, risks, gaps, citations.
-    
+
     Verify synthesis_version and prior_attempt_summary=None.
     """
     finding = Finding(
@@ -253,7 +257,7 @@ def test_critic_output_passed_boundary():
 
 def test_critic_output_passed_overrides_llm_value():
     """Construct with final_quality_score=4.5 but manually set passed=False.
-    
+
     Assert the resulting object has passed=True (demonstrating __post_init__ override).
     """
     # This test verifies that __post_init__ overrides whatever value is passed
@@ -280,7 +284,7 @@ def test_critic_output_passed_overrides_llm_value():
 
 def test_worker_results_reducer():
     """Simulate the LangGraph operator.add reducer for worker_results.
-    
+
     This confirms the reducer logic is correct for the Send fan-out pattern.
     """
     evidence1 = Evidence(
@@ -362,13 +366,13 @@ def test_research_agent_state_is_typeddict():
 
     # Verify it's a dict
     assert isinstance(state, dict)
-    
+
     # Verify key fields are present
     assert state["user_query"] == "test query"
     assert state["intent_type"] == "factual"
     assert state["output_format"] == "markdown"
     assert state["revision_count"] == 0
-    
+
     # Verify we can get type hints
     hints = get_type_hints(ResearchAgentState)
     assert "user_query" in hints
@@ -386,12 +390,12 @@ def test_worker_input_typeddict():
 
     # Verify it's a dict
     assert isinstance(worker_input, dict)
-    
+
     # Verify all required keys are present and accessible
     assert worker_input["worker_id"] == "worker_003"
     assert worker_input["sub_query"] == "What are the key features of Python 3.11?"
     assert worker_input["source_type"] == "web"
-    
+
     # Verify we can get type hints
     hints = get_type_hints(WorkerInput)
     assert "worker_id" in hints
@@ -407,7 +411,7 @@ def test_worker_input_typeddict():
 def test_source_type_literals():
     """Verify SourceType literal values are valid."""
     valid_sources: list[SourceType] = ["web", "academic", "news"]
-    
+
     # These should all be valid SourceType values
     for source in valid_sources:
         worker_input: WorkerInput = {
@@ -420,8 +424,13 @@ def test_source_type_literals():
 
 def test_intent_type_literals():
     """Verify IntentType literal values are valid."""
-    valid_intents: list[IntentType] = ["exploratory", "comparative", "adversarial", "factual"]
-    
+    valid_intents: list[IntentType] = [
+        "exploratory",
+        "comparative",
+        "adversarial",
+        "factual",
+    ]
+
     # These should all be valid IntentType values
     for intent in valid_intents:
         state: dict = {"intent_type": intent}
@@ -431,7 +440,7 @@ def test_intent_type_literals():
 def test_output_format_literals():
     """Verify OutputFormat literal values are valid."""
     valid_formats: list[OutputFormat] = ["markdown", "docx", "pdf", "pptx"]
-    
+
     # These should all be valid OutputFormat values
     for fmt in valid_formats:
         state: dict = {"output_format": fmt}
@@ -441,7 +450,7 @@ def test_output_format_literals():
 def test_issue_severity_literals():
     """Verify IssueSeverity literal values are valid."""
     valid_severities: list[IssueSeverity] = ["critical", "major", "minor"]
-    
+
     # These should all be valid IssueSeverity values
     for severity in valid_severities:
         issue = CriticIssue(

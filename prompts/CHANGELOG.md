@@ -17,15 +17,15 @@
 - **Eval delta**: N/A (baseline)
 
 ## coordinator_v1.txt
-- **Date**: project start
-- **What**: First-pass synthesis with citation requirements
-- **Why**: Baseline
+- **Date**: 2026-03-30
+- **What**: First-pass synthesis. Conflict rule (both positions), citation rule (evidence_refs required per finding), gaps rule (acknowledge unknowns), scope rule (no hallucination). Returns structured JSON: topic, executive_summary, findings[], risks[], gaps[], citation_urls[].
+- **Why**: Baseline — first implementation
 - **Eval delta**: N/A (baseline)
 
 ## coordinator_revision_v1.txt
-- **Date**: project start
-- **What**: Revision-pass synthesis with explicit "do not restate" instruction
-- **Why**: Without this, revision loop produces expensive paraphrases not fixes
+- **Date**: 2026-03-30
+- **What**: Revision-pass synthesis. Adds PRIOR SYNTHESIS and CRITIC ISSUES blocks. Verbatim "do not restate" constraint: each critic issue must be addressed with new evidence or added to gaps[] as "Unresolved: [issue]". VERSION RULE: only change what critic flagged.
+- **Why**: Without explicit "do not restate" instruction, revision loop produces expensive paraphrases instead of targeted fixes
 - **Eval delta**: N/A (baseline)
 
 ## critic_v1.txt
@@ -35,6 +35,12 @@
 - **Eval delta**: N/A (baseline)
 
 ---
+
+## grounding_check_v1.txt
+- **Date**: 2026-03-31
+- **What**: Fact-checker prompt validating synthesis findings against cited evidence. Detects three issue types: UNSUPPORTED (claim absent from evidence), HALLUCINATED_CITATION (URL present but unrelated), MISSING_CITATION (claim exists in evidence but no ref). Returns structured JSON `{issues:[{type,finding_heading,description}]}`. Empty array if clean.
+- **Why**: Baseline — first implementation
+- **Eval delta**: N/A (baseline)
 
 ## Template for new entries
 
