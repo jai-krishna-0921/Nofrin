@@ -35,7 +35,10 @@
       "Bash(pytest tests/test_grounding_check.py -v --co -q)",
       "Bash(pytest tests/test_grounding_check.py --collect-only -q)",
       "Bash(pytest tests/ -v --tb=short)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "Read(//tmp/**)",
+      "Bash(mypy agents/critic.py tests/test_critic.py --strict)",
+      "Bash(mypy:*)"
     ]
   }
 }

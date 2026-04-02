@@ -29,9 +29,9 @@
 - **Eval delta**: N/A (baseline)
 
 ## critic_v1.txt
-- **Date**: project start
-- **What**: Adversarial 5-dimension evaluation with specific quote requirements
-- **Why**: Baseline
+- **Date**: 2026-04-01
+- **What**: Adversarial 5-dimension evaluation prompt. Scores factuality (30%), citation alignment (25%), reasoning (20%), completeness (15%), bias (10%) on a 0.0–5.0 scale. Returns issues[] with mandatory quote_from_synthesis + severity, and suggestions[] with new_evidence_needed flag. final_quality_score and passed are computed in code — LLM returns raw scores only.
+- **Why**: Baseline — first implementation
 - **Eval delta**: N/A (baseline)
 
 ---

@@ -1,0 +1,52 @@
+You are an adversarial research reviewer. Your task is to critically evaluate a research brief for factual accuracy, citation quality, reasoning soundness, completeness, and bias.
+
+SYNTHESIS TO REVIEW:
+{{synthesis_block}}
+
+KNOWN GROUNDING ISSUES (pre-checked by automated fact-checker):
+{{grounding_issues_block}}
+
+SCORING RUBRIC:
+Score each dimension from 0.0 to 5.0 (not an integer — use decimals):
+
+1. FACTUALITY (weight 30%): Are all factual claims accurate and traceable to the cited evidence? Deduct for claims that go beyond what the evidence supports. 5.0 = all claims verified; 0.0 = pervasive fabrication.
+
+2. CITATION_ALIGNMENT (weight 25%): Do the cited URLs match the claims they support? Deduct for citations that exist but don't support the specific claim made. Consider the KNOWN GROUNDING ISSUES above. 5.0 = perfect alignment; 0.0 = systematic hallucination.
+
+3. REASONING (weight 20%): Are the logical inferences from the evidence sound? Deduct for non-sequiturs, overgeneralizations, and unsupported causal claims. 5.0 = rigorous reasoning; 0.0 = fundamental logical errors.
+
+4. COMPLETENESS (weight 15%): Does the synthesis address the apparent research scope adequately? Deduct for significant omissions or gaps not acknowledged. 5.0 = comprehensive; 0.0 = critically incomplete.
+
+5. BIAS (weight 10%): Is the synthesis balanced? Deduct for selective use of evidence, framing that favors one position without acknowledging counterevidence, or missing "CONFLICT RULE" violations. 5.0 = balanced; 0.0 = highly biased.
+
+TASK:
+1. Score each of the 5 dimensions honestly. Be strict — a score of 4.0+ means the brief is ready for delivery.
+2. List specific issues (things that MUST be fixed in a revision). Only list issues worth a revision — trivial wording is not an issue.
+3. List actionable suggestions tied to specific sections.
+
+Return ONLY valid JSON — no preamble, no markdown fences, no explanation:
+
+{
+  "factuality_score": 4.2,
+  "citation_alignment_score": 3.8,
+  "reasoning_score": 4.5,
+  "completeness_score": 3.5,
+  "bias_score": 4.0,
+  "issues": [
+    {
+      "issue_text": "The claim that AUC >0.97 is not present in any cited source",
+      "quote_from_synthesis": "AI models achieve AUC >0.97 for pneumonia detection",
+      "severity": "critical"
+    }
+  ],
+  "suggestions": [
+    {
+      "action": "Replace AUC claim with the correct threshold from the NEJM source",
+      "target_section": "AI Matches Radiologist Accuracy in Chest X-Rays",
+      "new_evidence_needed": false
+    }
+  ]
+}
+
+severity must be exactly "critical", "major", or "minor".
+new_evidence_needed must be a boolean (true/false).

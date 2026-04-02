@@ -17,7 +17,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agents.grounding_check import (
-    PROMPT_PATH,
     _build_messages,
     _load_prompt,
     _parse_grounding_output,
@@ -417,7 +416,9 @@ async def test_multiple_findings_all_clean() -> None:
         make_evidence(source_url="http://example.com/3"),
     ]
     synthesis = make_synthesis(findings=findings)
-    state = make_state(synthesis=synthesis, worker_results=[make_worker_result(evidences)])
+    state = make_state(
+        synthesis=synthesis, worker_results=[make_worker_result(evidences)]
+    )
 
     async def mock_ainvoke(messages: Any) -> Any:
         return llm_response_json([])
