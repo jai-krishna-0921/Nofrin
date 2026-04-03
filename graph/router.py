@@ -1,9 +1,12 @@
 """
 graph/router.py
 
-Routing logic for the Deep Research Agent critic loop.
+Routing logic for the Deep Research Agent.
 
 Nodes / functions defined here:
+
+  dispatch_workers     — conditional-edge function; called after supervisor.
+                         Returns list[Send] to fan-out one worker per sub-query.
 
   budget_gate_node     — regular node; appends a gap warning to synthesis if
                          cost_usd > 75 % of cost_ceiling_usd, then returns the
@@ -13,6 +16,8 @@ Nodes / functions defined here:
                          next node: "delivery" or "coordinator".
 
 Wiring (in graph/builder.py):
+  supervisor → conditional(dispatch_workers) → worker × N (fan-out)
+  worker → boundary_compressor (fan-in via operator.add reducer)
   ... → critic → budget_gate_node → conditional(route_after_critic)
                                          ├── "delivery"   (pass / budget / cap)
                                          └── "coordinator" (revise)
@@ -23,15 +28,63 @@ from __future__ import annotations
 import dataclasses
 
 from langgraph.runtime import Runtime
+from langgraph.types import Send
 
 from graph.context import NofrinContext
-from graph.state import ResearchAgentState, SynthesisOutput
+from graph.state import ResearchAgentState, SourceType, SynthesisOutput, WorkerInput
 
 # Fraction of the cost ceiling that triggers a forced delivery.
 _BUDGET_THRESHOLD = 0.75
 
 # Hard revision cap (also enforced in CLAUDE.md; keep in sync).
 _MAX_REVISIONS = 2
+
+
+# ---------------------------------------------------------------------------
+# Fan-out dispatcher: supervisor → workers
+# ---------------------------------------------------------------------------
+
+
+def dispatch_workers(
+    state: ResearchAgentState,
+) -> list[Send]:
+    """Fan-out dispatcher: create one Send() per sub-query targeting the worker node.
+
+    Called via add_conditional_edges after supervisor_node completes.
+    Reads state["sub_queries"] and state["source_routing"] (written by supervisor).
+
+    Worker IDs are sequential: "worker-0", "worker-1", etc.
+    If a sub_query is absent from source_routing, defaults to "web".
+
+    Args:
+        state: Current ResearchAgentState after supervisor node.
+
+    Returns:
+        list[Send] — one Send("worker", WorkerInput) per sub-query.
+
+    Raises:
+        ValueError: If sub_queries is empty.
+    """
+    sub_queries: list[str] = state["sub_queries"]
+    source_routing: dict[str, SourceType] = state["source_routing"]
+
+    if not sub_queries:
+        raise ValueError(
+            "dispatch_workers: sub_queries is empty — "
+            "supervisor_node must populate sub_queries before dispatch."
+        )
+
+    sends: list[Send] = []
+    for idx, sub_query in enumerate(sub_queries):
+        source_type: SourceType = source_routing.get(sub_query, "web")
+        worker_input = WorkerInput(
+            worker_id=f"worker-{idx}",
+            sub_query=sub_query,
+            source_type=source_type,
+        )
+        sends.append(Send("worker", worker_input))
+
+    return sends
 
 
 # ---------------------------------------------------------------------------
@@ -116,4 +169,4 @@ def route_after_critic(
     return "coordinator"
 
 
-__all__ = ["budget_gate_node", "route_after_critic"]
+__all__ = ["budget_gate_node", "dispatch_workers", "route_after_critic"]

@@ -14,9 +14,7 @@ import pytest
 
 from agents.delivery import delivery_node, render_markdown
 from graph.state import (
-    CriticIssue,
     CriticOutput,
-    CriticSuggestion,
     Evidence,
     Finding,
     ResearchAgentState,
@@ -181,12 +179,8 @@ async def test_markdown_contains_all_finding_headings() -> None:
         ),
     ]
     citations = [
-        build_evidence(
-            source_url="https://example.com/1", source_title="Source 1"
-        ),
-        build_evidence(
-            source_url="https://example.com/2", source_title="Source 2"
-        ),
+        build_evidence(source_url="https://example.com/1", source_title="Source 1"),
+        build_evidence(source_url="https://example.com/2", source_title="Source 2"),
     ]
     synthesis = build_synthesis(findings=findings, citations=citations)
     state = build_state(synthesis=synthesis)

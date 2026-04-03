@@ -3,16 +3,10 @@ graph/builder.py
 
 LangGraph workflow assembly for the Deep Research Agent.
 
-Current wiring (Phase 5 — nodes implemented so far):
-  START → supervisor → boundary_compressor → coordinator → grounding_check
-        → critic → budget_gate → conditional(route_after_critic)
-              ├── "delivery" → END
-              └── "coordinator"     (revision loop, max 2)
-
-Planned full wiring (Phase 1 complete):
+Current wiring (Phase 6 — full pipeline wired):
   START → supervisor
-        → [Send() fan-out: worker × N]
-        → boundary_compressor
+        → [Send() fan-out: worker × N]   (dispatch_workers)
+        → boundary_compressor             (fan-in via operator.add)
         → coordinator
         → grounding_check
         → critic
@@ -30,7 +24,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
 from graph.context import NofrinContext
-from graph.state import ResearchAgentState
+from graph.state import ResearchAgentState, WorkerInput
 
 
 def build_graph() -> CompiledStateGraph:  # type: ignore[type-arg]
@@ -75,39 +69,34 @@ def build_graph() -> CompiledStateGraph:  # type: ignore[type-arg]
     from agents.delivery import delivery_node
     from agents.grounding_check import grounding_check_node
     from agents.supervisor import supervisor_node
+    from agents.worker import worker_node
     from graph.boundary_compressor import boundary_compressor_node
-    from graph.router import budget_gate_node, route_after_critic
+    from graph.router import budget_gate_node, dispatch_workers, route_after_critic
 
     builder.add_node("supervisor", supervisor_node)  # type: ignore[call-overload]
+    builder.add_node("worker", worker_node, input_schema=WorkerInput)  # type: ignore[call-overload]
     builder.add_node("boundary_compressor", boundary_compressor_node)
     builder.add_node("coordinator", coordinator_node)  # type: ignore[arg-type]
     builder.add_node("grounding_check", grounding_check_node)  # type: ignore[arg-type]
     builder.add_node("critic", critic_node)  # type: ignore[arg-type]
     builder.add_node("budget_gate", budget_gate_node)  # type: ignore[arg-type]
-    builder.add_node("delivery", delivery_node)  # type: ignore[arg-type]
-
-    # TODO: add as implemented
-    # from agents.worker import worker_node
-    # builder.add_node("worker", worker_node, cache_policy=CachePolicy(ttl=300))
+    builder.add_node("delivery", delivery_node)
 
     # ── Edges ─────────────────────────────────────────────────────────────────
 
     builder.add_edge(START, "supervisor")
-    builder.add_edge("supervisor", "boundary_compressor")
+    builder.add_conditional_edges("supervisor", dispatch_workers, ["worker"])
+    builder.add_edge("worker", "boundary_compressor")
     builder.add_edge("boundary_compressor", "coordinator")
     builder.add_edge("coordinator", "grounding_check")
     builder.add_edge("grounding_check", "critic")
     builder.add_edge("critic", "budget_gate")
     builder.add_conditional_edges(
         "budget_gate",
-        route_after_critic,  # type: ignore[arg-type]
+        route_after_critic,
         {"delivery": "delivery", "coordinator": "coordinator"},
     )
     builder.add_edge("delivery", END)
-
-    # TODO: Phase 2 — replace supervisor→boundary_compressor with Send() fan-out:
-    #   builder.add_conditional_edges("supervisor", dispatch_workers, ["worker"])
-    #   builder.add_edge("worker", "boundary_compressor")   # fan-in via operator.add
 
     return builder.compile()
 

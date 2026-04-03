@@ -1,299 +1,254 @@
-# Plan: agents/delivery.py
+# Plan: Send() Fan-out Parallel Worker Dispatch
 
-> **Context:** coordinator + grounding_check + critic done (142/142 tests). Next: delivery (final node before END).
+> **Context:** All nodes done (166/166 tests). This wires the supervisor → workers fan-out that was stubbed as `add_edge("supervisor", "boundary_compressor")`.
+
+---
 
 ## Problem Statement
 
-The delivery node is the terminal formatting node in the Deep Research Agent pipeline. It transforms the structured `SynthesisOutput` (and optional `CriticOutput`) into a human-readable document in the requested output format. Unlike other agent nodes, delivery performs **pure formatting logic with zero LLM calls**. It must detect the force-delivery case (`revision_count >= 2`, `critic_output.passed == False`) and inject a quality caveat at the top of the output. The node reads `output_format` from state and dispatches to the appropriate renderer (markdown only for now; docx/pdf/pptx are TODO stubs that raise `NotImplementedError`).
+`supervisor_node` decomposes the user query into 3–5 sub-queries with source-type routing (web/academic/news) and writes them to `state["sub_queries"]` and `state["source_routing"]`. The worker node (`agents/worker.py`) is fully implemented and accepts `WorkerInput` via Send(). The fan-out dispatch function and its graph wiring are the only missing pieces. `worker_results` already uses `Annotated[list[WorkerResult], operator.add]`, so parallel results accumulate automatically.
+
+---
+
+## LangGraph Send() API (from context7)
+
+```python
+from langgraph.types import Send
+
+Send(node: str, arg: Any)
+```
+
+- `node` — target node name string
+- `arg` — state payload passed to that node invocation
+
+**Fan-out pattern:**
+```python
+def dispatch_function(state: StateType) -> list[Send]:
+    return [Send("worker", payload) for payload in payloads]
+
+builder.add_conditional_edges("supervisor", dispatch_function, ["worker"])
+builder.add_edge("worker", "boundary_compressor")  # fan-in
+```
+
+- When the conditional function returns `list[Send]`, LangGraph spawns parallel invocations.
+- The `["worker"]` in the third arg is a list of reachable node names (not a dict — this is different from string-routing).
+- Fan-in: `add_edge("worker", "boundary_compressor")` ensures all workers complete before boundary_compressor runs.
+- `operator.add` reducer on `worker_results` automatically concatenates each worker's `{"worker_results": [one_result]}`.
 
 ---
 
 ## Answers to Planning Questions
 
-### Q1: What does delivery read from state?
+### Q1: Which node dispatches the Send() calls?
 
-| Field | Read | Why |
-|---|---|---|
-| `synthesis` | ✅ | Primary content: topic, executive_summary, findings, risks, gaps, citations |
-| `critic_output` | ✅ | Quality badge: `critic_output.passed` and `final_quality_score` |
-| `output_format` | ✅ | Dispatches to correct renderer |
-| `revision_count` | ✅ | Detects force-delivery case |
-| `cost_usd` | ❌ | Not user-facing |
-| `final_output` | ❌ | This is what we WRITE, not read |
-| `grounding_issues` | ❌ | Already incorporated into critic scoring |
+A `dispatch_workers` function in **`graph/router.py`** (keeps all routing logic together alongside `route_after_critic`). It reads `state["sub_queries"]` and `state["source_routing"]` after supervisor completes and returns `list[Send]`. No LLM calls — pure state transformation.
 
-### Q2: What format(s) does it produce?
-
-- `markdown`: Fully implemented via `render_markdown()` pure function.
-- `docx`, `pdf`, `pptx`: Raise `NotImplementedError("Format not yet implemented")` stubs.
-
-**Why markdown only:** Other formats require external dependencies (python-docx, WeasyPrint, python-pptx) not yet integrated. Markdown is the dev-default format and serves as the reference renderer.
-
-### Q3: State write
-
-Returns `{"final_output": str}` — LangGraph merges this partial update into state.
-
-### Q4: Force-delivery case
-
-**Detection:**
-```python
-is_force_delivered = (
-    state["revision_count"] >= _MAX_REVISIONS
-    and state["critic_output"] is not None
-    and not state["critic_output"].passed
-)
-```
-
-**Caveat text (exact):**
-```
-> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.
-```
-
-Injected at the very top of the markdown output, before the title.
-
-### Q5: LLM call?
-
-**None.** Zero LLM calls, zero token cost. No prompt file needed. No runtime context needed.
-
-### Q6: Graph wiring change in builder.py
+### Q2: What does each Send() carry?
 
 ```python
-# Add import:
-from agents.delivery import delivery_node
-
-# Add node:
-builder.add_node("delivery", delivery_node)
-
-# Update conditional edges (replace END stub):
-builder.add_conditional_edges(
-    "budget_gate",
-    route_after_critic,
-    {"delivery": "delivery", "coordinator": "coordinator"},
-)
-
-# Add terminal edge:
-builder.add_edge("delivery", END)
+Send("worker", WorkerInput(
+    worker_id="worker-0",
+    sub_query="...",
+    source_type="academic",
+))
 ```
 
-Remove: the `{"delivery": END, ...}` stub in the current conditional edges map.
+`worker_node` signature (confirmed from `agents/worker.py`):
+```python
+async def worker_node(state: WorkerInput, runtime: Runtime[NofrinContext]) -> dict[str, list[WorkerResult]]:
+```
+Worker reads only `worker_id`, `sub_query`, `source_type` — the three `WorkerInput` fields. Send() must pass `WorkerInput`, not `ResearchAgentState`.
 
-### Q7: Estimated token cost
+### Q3: How do worker results merge back?
 
-**$0.00** — pure formatting.
+`worker_results: Annotated[list[WorkerResult], operator.add]` — LangGraph applies the reducer automatically. Each worker returns `{"worker_results": [single_result]}`. After all N workers complete, `worker_results` contains all N items. No merge code needed.
+
+### Q4: Where does boundary_compressor fit?
+
+After all workers complete (fan-in via `add_edge("worker", "boundary_compressor")`). LangGraph guarantees all parallel Send() invocations finish before the next node runs.
+
+### Q5: Changes in graph/builder.py
+
+```diff
+- builder.add_edge("supervisor", "boundary_compressor")
++ builder.add_conditional_edges("supervisor", dispatch_workers, ["worker"])
++ builder.add_edge("worker", "boundary_compressor")
+```
+
+Add imports inside `build_graph()`:
+```python
+from agents.worker import worker_node
+from graph.router import budget_gate_node, dispatch_workers, route_after_critic
+```
+
+Add node:
+```python
+builder.add_node("worker", worker_node)  # type: ignore[arg-type]
+```
+
+Remove the TODO comment block that described this change as future work.
+
+### Q6: Changes in graph/router.py
+
+Add `dispatch_workers` function and update `__all__`. No changes to existing functions.
+
+New imports needed at top of router.py:
+```python
+from langgraph.types import Send
+```
+
+(Already imports `ResearchAgentState`, `SourceType`, `WorkerInput` — verify and add any missing.)
+
+### Q7: New agent files?
+
+**None.** `worker_node` is already implemented. This is purely graph wiring.
 
 ### Q8: Tests
 
-24 test cases — see table below.
+10 test cases in `tests/test_dispatch_workers.py` — see table below.
+
+### Q9: WorkerInput vs ResearchAgentState
+
+**`WorkerInput`** — confirmed from `agents/worker.py`. Worker reads only `worker_id`, `sub_query`, `source_type`.
+
+### Q10: worker_id assignment
+
+Sequential: `"worker-0"`, `"worker-1"`, … — deterministic, index-correlated, no UUID overhead.
 
 ---
 
-## Files to Create / Modify
+## Files to Modify
 
 | Path | Action |
 |---|---|
-| `agents/delivery.py` | **Create** |
-| `agents/__init__.py` | **Update** — export `delivery_node` |
-| `graph/builder.py` | **Update** — wire delivery node, update conditional edges |
-| `tests/test_delivery.py` | **Create** — 24 tests |
+| `graph/router.py` | **Update** — add `dispatch_workers` function, update `__all__` |
+| `graph/builder.py` | **Update** — add worker node, replace supervisor→boundary_compressor edge with fan-out |
+| `tests/test_dispatch_workers.py` | **Create** — 10 tests |
 
 ---
 
-## Function Signatures (no implementation bodies)
+## dispatch_workers Signature (full)
 
 ```python
-"""
-agents/delivery.py
-
-Delivery node: format SynthesisOutput into the requested output format.
-
-Reads:  state["synthesis"], state["critic_output"], state["output_format"],
-        state["revision_count"]
-Writes: state["final_output"]
-
-Pure formatting logic — no LLM calls, no token cost.
-No prompt file needed.
-"""
-
-_QUALITY_CAVEAT_TEMPLATE: str = (
-    "> **QUALITY NOTICE:** This research brief was delivered after reaching "
-    "the maximum revision limit (2 revisions) without meeting the quality "
-    "threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.\n"
-)
-
-_MAX_REVISIONS: int = 2  # must match graph/router.py._MAX_REVISIONS
-
-
-def _is_force_delivered(state: ResearchAgentState) -> bool:
-    """Return True if revision_count >= 2 AND critic_output.passed == False."""
-    ...
-
-
-def _build_citation_map(citations: list[Evidence]) -> dict[str, int]:
-    """Build URL → 1-based footnote index mapping from synthesis.citations."""
-    ...
-
-
-def _render_finding(finding: Finding, citation_map: dict[str, int]) -> str:
-    """Render a single finding as markdown (### heading, body, [^N] refs)."""
-    ...
-
-
-def _render_citations_section(citations: list[Evidence]) -> str:
-    """Render the References section with footnote definitions.
-
-    Format: [^1]: [Source Title](URL) - Published: YYYY-MM-DD
-    Returns empty string if citations is empty.
-    """
-    ...
-
-
-def _render_quality_badge(
-    critic_output: CriticOutput | None,
-    is_force_delivered: bool,
-) -> str:
-    """Render the quality badge line.
-
-    Outputs:
-      "**Quality: PASS** (4.25/5.0)"    — when critic_output.passed
-      "**Quality: REVIEW RECOMMENDED** (3.50/5.0)"  — when force-delivered
-      "**Quality: N/A**"                 — when critic_output is None
-    """
-    ...
-
-
-def render_markdown(
-    synthesis: SynthesisOutput,
-    critic_output: CriticOutput | None,
-    is_force_delivered: bool,
-) -> str:
-    """Render SynthesisOutput as a complete markdown document.
-
-    Pure function: no side effects, no LLM calls, deterministic output.
-
-    Section order:
-        1. Quality caveat (ONLY if force-delivered)
-        2. # {topic}
-        3. Quality badge line
-        4. ## Executive Summary
-        5. ## Key Findings (### per finding, [^N] footnote refs)
-        6. ## Risks  (omit if empty)
-        7. ## Known Gaps  (omit if empty)
-        8. ## References (footnote definitions, omit if no citations)
-    """
-    ...
-
-
-async def delivery_node(
+def dispatch_workers(
     state: ResearchAgentState,
-) -> dict[str, str]:
-    """LangGraph node: format synthesis into the requested output format.
+) -> list[Send]:
+    """Fan-out dispatcher: create one Send() per sub-query targeting the worker node.
 
-    Note: no Runtime parameter — no LLM client needed.
+    Called via add_conditional_edges after supervisor_node completes.
+    Reads state["sub_queries"] and state["source_routing"] (written by supervisor).
+
+    Worker IDs are sequential: "worker-0", "worker-1", etc.
+    If a sub_query is not in source_routing, defaults to "web".
+
+    Args:
+        state: Current ResearchAgentState after supervisor node.
+
+    Returns:
+        list[Send] — one Send("worker", WorkerInput) per sub-query.
 
     Raises:
-        ValueError: If synthesis is None.
-        NotImplementedError: If output_format is "docx", "pdf", or "pptx".
+        ValueError: If sub_queries is empty.
     """
-    ...
 ```
 
 ---
 
-## render_markdown() Output Specification
+## graph/router.py changes (exact additions)
 
-### Section order (exact)
-
-```
-1. [Quality caveat — only if force-delivered]
-2. # {topic}
-3. {quality_badge}
-4. ## Executive Summary
-   {executive_summary}
-5. ## Key Findings
-   ### {finding.heading}
-   {finding.body}[^i][^j]
-6. ## Risks         [omit if empty]
-   - {risk}
-7. ## Known Gaps    [omit if empty]
-   - {gap}
-8. ## References    [omit if no citations]
-   [^1]: [Title](URL) - Published: date
+**New import** (add to existing imports at top):
+```python
+from langgraph.types import Send
 ```
 
-### Example (force-delivered, score 3.50)
+**New function** (add before `__all__`):
+```python
+# ---------------------------------------------------------------------------
+# Fan-out dispatcher: supervisor → workers
+# ---------------------------------------------------------------------------
 
-```markdown
-> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: 3.50/5.0). Review with appropriate scrutiny.
 
-# Renewable Energy Investment Trends 2025
+def dispatch_workers(
+    state: ResearchAgentState,
+) -> list[Send]:
+    """Fan-out dispatcher: create one Send() per sub-query..."""
+    sub_queries: list[str] = state["sub_queries"]
+    source_routing: dict[str, SourceType] = state["source_routing"]
 
-**Quality: REVIEW RECOMMENDED** (3.50/5.0)
+    if not sub_queries:
+        raise ValueError(
+            "dispatch_workers: sub_queries is empty — "
+            "supervisor_node must populate sub_queries before dispatch."
+        )
 
-## Executive Summary
+    sends: list[Send] = []
+    for idx, sub_query in enumerate(sub_queries):
+        source_type: SourceType = source_routing.get(sub_query, "web")
+        worker_input = WorkerInput(
+            worker_id=f"worker-{idx}",
+            sub_query=sub_query,
+            source_type=source_type,
+        )
+        sends.append(Send("worker", worker_input))
 
-Global renewable energy investments reached $500 billion in 2024...
-
-## Key Findings
-
-### Solar Costs Continue to Decline
-
-The levelized cost of solar energy dropped 12% year-over-year.[^1][^2]
-
-## Risks
-
-- Supply chain constraints may slow deployment in 2025
-
-## Known Gaps
-
-- Limited data on emerging markets
-
-## References
-
-[^1]: [IEA World Energy Outlook 2024](https://iea.org/reports/weo-2024) - Published: 2024-10-15
-[^2]: [BloombergNEF Solar Report](https://about.bnef.com/solar) - Published: 2024-09-20
+    return sends
 ```
 
-### Example (passed, score 4.25)
-
-```markdown
-# Renewable Energy Investment Trends 2025
-
-**Quality: PASS** (4.25/5.0)
-
-## Executive Summary
-...
+**Update `__all__`:**
+```python
+__all__ = ["budget_gate_node", "dispatch_workers", "route_after_critic"]
 ```
 
 ---
 
-## Test Cases (24)
+## graph/builder.py changes (exact diff)
+
+```diff
+ # ── Nodes ──────────────────────────────────────────────────────────────────
+
+     from agents.coordinator import coordinator_node
+     from agents.critic import critic_node
+     from agents.delivery import delivery_node
+     from agents.grounding_check import grounding_check_node
+     from agents.supervisor import supervisor_node
++    from agents.worker import worker_node
+     from graph.boundary_compressor import boundary_compressor_node
+-    from graph.router import budget_gate_node, route_after_critic
++    from graph.router import budget_gate_node, dispatch_workers, route_after_critic
+
+     builder.add_node("supervisor", supervisor_node)  # type: ignore[call-overload]
++    builder.add_node("worker", worker_node)  # type: ignore[arg-type]
+     builder.add_node("boundary_compressor", boundary_compressor_node)
+
+ # ── Edges ──────────────────────────────────────────────────────────────────
+
+     builder.add_edge(START, "supervisor")
+-    builder.add_edge("supervisor", "boundary_compressor")
++    builder.add_conditional_edges("supervisor", dispatch_workers, ["worker"])
++    builder.add_edge("worker", "boundary_compressor")
+     builder.add_edge("boundary_compressor", "coordinator")
+     ...
+-    # TODO: Phase 2 — replace supervisor→boundary_compressor with Send() fan-out:
+-    #   builder.add_conditional_edges("supervisor", dispatch_workers, ["worker"])
+-    #   builder.add_edge("worker", "boundary_compressor")   # fan-in via operator.add
+```
+
+---
+
+## Test Cases (10)
 
 | # | Test | Assertion |
 |---|---|---|
-| 1 | `test_delivery_node_returns_final_output_key` | `"final_output" in result` |
-| 2 | `test_final_output_is_string` | `isinstance(result["final_output"], str)` |
-| 3 | `test_markdown_contains_topic_as_title` | `"# Test Topic"` in output |
-| 4 | `test_markdown_contains_executive_summary_heading` | `"## Executive Summary"` in output |
-| 5 | `test_markdown_contains_all_finding_headings` | All finding headings as `###` in output |
-| 6 | `test_findings_have_footnote_refs` | `[^1]` appears in finding body |
-| 7 | `test_risks_section_present_when_nonempty` | `"## Risks"` in output |
-| 8 | `test_gaps_section_present_when_nonempty` | `"## Known Gaps"` in output |
-| 9 | `test_citations_section_present` | `"## References"` and `[^1]:` in output |
-| 10 | `test_quality_badge_pass` | `"Quality: PASS"` in output when `critic_output.passed=True` |
-| 11 | `test_quality_badge_review_recommended` | `"Quality: REVIEW RECOMMENDED"` when force-delivered |
-| 12 | `test_force_delivery_caveat_injected_at_top` | `"QUALITY NOTICE:"` is first non-empty line |
-| 13 | `test_force_delivery_caveat_contains_score` | `"3.50/5.0"` in caveat string |
-| 14 | `test_no_caveat_when_critic_passed` | `"QUALITY NOTICE"` not in output |
-| 15 | `test_no_caveat_when_revision_under_cap` | `revision_count=1, passed=False` → no caveat |
-| 16 | `test_synthesis_none_raises_value_error` | `ValueError` before any rendering |
-| 17 | `test_output_format_markdown_produces_output` | `len(result["final_output"]) > 0` |
-| 18 | `test_output_format_docx_raises_not_implemented` | `NotImplementedError` |
-| 19 | `test_output_format_pdf_raises_not_implemented` | `NotImplementedError` |
-| 20 | `test_output_format_pptx_raises_not_implemented` | `NotImplementedError` |
-| 21 | `test_render_markdown_is_pure` | Same args → identical output on two calls |
-| 22 | `test_citations_format_url_and_title` | `[Title](URL)` pattern in References |
-| 23 | `test_empty_risks_omits_section` | `"## Risks"` NOT in output when `risks=[]` |
-| 24 | `test_empty_gaps_omits_section` | `"## Known Gaps"` NOT in output when `gaps=[]` |
+| 1 | `test_dispatch_workers_returns_list_of_send` | `all(isinstance(s, Send) for s in result)` |
+| 2 | `test_dispatch_workers_count_matches_sub_queries` | `len(result) == len(sub_queries)` |
+| 3 | `test_dispatch_workers_target_node_is_worker` | `all(s.node == "worker" for s in result)` |
+| 4 | `test_worker_ids_are_sequential` | worker_ids in payloads are `["worker-0", "worker-1", "worker-2"]` |
+| 5 | `test_sub_queries_preserved_in_payload` | Each `Send.arg["sub_query"]` matches `sub_queries[i]` |
+| 6 | `test_source_types_from_routing` | `Send.arg["source_type"]` matches `source_routing[sub_query]` |
+| 7 | `test_missing_routing_defaults_to_web` | Sub-query absent from routing dict → `source_type == "web"` |
+| 8 | `test_empty_sub_queries_raises_value_error` | `ValueError` when `sub_queries == []` |
+| 9 | `test_three_sub_queries_creates_three_sends` | 3 queries → 3 Sends |
+| 10 | `test_five_sub_queries_creates_five_sends` | 5 queries → 5 Sends |
 
 ---
 
@@ -301,23 +256,25 @@ The levelized cost of solar energy dropped 12% year-over-year.[^1][^2]
 
 | Failure | Cause | Mitigation |
 |---|---|---|
-| `synthesis is None` | delivery called before coordinator | `ValueError` |
-| `critic_output is None` | edge case — critic skipped | Badge shows `N/A` |
-| Unsupported `output_format` | docx/pdf/pptx request | `NotImplementedError` |
-| Empty `findings` | coordinator edge case | `## Key Findings` section renders empty |
-| URL not in `citation_map` | evidence_ref not in citations | Append URL inline without footnote |
-| `revision_count > _MAX_REVISIONS` | router bug | `>= 2` check still fires correctly |
+| Empty `sub_queries` | Supervisor validation failure | `ValueError` with clear message |
+| Sub-query not in `source_routing` | Supervisor bug | Default to `"web"` |
+| Worker exceeds rate limit | Too many concurrent Exa calls | Existing tenacity retry in `worker.py` |
+| One worker fails | Exception propagates | `worker.py` uses `asyncio.gather(return_exceptions=True)` internally |
+| `Send` import missing | LangGraph version | `from langgraph.types import Send` (LangGraph 1.0+) |
+| Type error on worker node | Wrong state type passed | Worker expects `WorkerInput` — Send() carries exactly that |
+
+---
+
+## Token Cost Impact
+
+`dispatch_workers` is pure Python — zero LLM calls, zero token cost. Worker token costs are unchanged (already implemented in `worker.py`, just not wired).
 
 ---
 
 ## Architect Notes
 
-1. **No `runtime` parameter** — same pattern as `boundary_compressor_node`. Signature is `async def delivery_node(state: ResearchAgentState) -> dict[str, str]`.
-
-2. **`_MAX_REVISIONS = 2`** — must be kept in sync with `graph/router.py._MAX_REVISIONS`. Do not import from router (circular import risk); declare as a local constant.
-
-3. **`render_markdown` exported** — for direct testing and future reuse by docx/pptx renderers as a reference.
-
-4. **Section blank lines** — separate each section with a double newline (`\n\n`) for valid markdown rendering.
-
-5. **Footnote refs in findings** — only include `[^N]` for URLs present in `citation_map`; silently skip unknown refs.
+1. **`dispatch_workers` is not async** — it's a plain sync function. LangGraph conditional edge functions are synchronous.
+2. **`["worker"]` not `{"worker": "worker"}`** — when returning `list[Send]`, the third arg to `add_conditional_edges` is a `list[str]` of reachable node names, NOT a dict path map.
+3. **No `runtime` param on `dispatch_workers`** — routing functions only receive state.
+4. **mypy `--strict`**: `Send` from `langgraph.types` — verify no `# type: ignore` needed.
+5. **`source_routing.get(sub_query, "web")`** — `TypedDict` `dict` access returns `SourceType | None`; `.get()` with default makes mypy happy without a cast.
