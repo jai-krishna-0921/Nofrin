@@ -38,7 +38,8 @@
       "Bash(python:*)",
       "Read(//tmp/**)",
       "Bash(mypy agents/critic.py tests/test_critic.py --strict)",
-      "Bash(mypy:*)"
+      "Bash(mypy:*)",
+      "WebFetch(domain:reference.langchain.com)"
     ]
   }
 }

@@ -1,485 +1,323 @@
-# Plan: agents/critic.py
+# Plan: agents/delivery.py
 
-> **Context:** coordinator + grounding_check done (122/122 tests). Next: critic → delivery.
+> **Context:** coordinator + grounding_check + critic done (142/142 tests). Next: delivery (final node before END).
 
-## Problem
+## Problem Statement
 
-The critic node is the adversarial reviewer in the revision loop. It reads the
-`SynthesisOutput` produced by coordinator, uses `grounding_issues` from grounding_check
-as pre-computed context, and scores the synthesis across 5 dimensions. The score drives
-the routing decision: pass to delivery or route back to coordinator for revision.
-
-Key design constraints:
-1. `CriticOutput` is already fully typed in `graph/state.py` — implement to that schema exactly.
-2. `final_quality_score` and `passed` are computed in code — NOT trusted from LLM output.
-3. `route_after_critic` in `graph/router.py` is already complete — critic node only writes
-   `critic_output` to state; routing happens downstream.
-4. CLAUDE.md: revision cap = 2. After 2 revisions, router force-delivers; critic does NOT
-   inject the caveat (that is `budget_gate_node`'s pattern — handled by routing layer).
-5. Uses `llm_critic` (already in NofrinContext — the most capable model).
+The delivery node is the terminal formatting node in the Deep Research Agent pipeline. It transforms the structured `SynthesisOutput` (and optional `CriticOutput`) into a human-readable document in the requested output format. Unlike other agent nodes, delivery performs **pure formatting logic with zero LLM calls**. It must detect the force-delivery case (`revision_count >= 2`, `critic_output.passed == False`) and inject a quality caveat at the top of the output. The node reads `output_format` from state and dispatches to the appropriate renderer (markdown only for now; docx/pdf/pptx are TODO stubs that raise `NotImplementedError`).
 
 ---
 
-## Answers to planning questions
+## Answers to Planning Questions
 
-### Q1: Five evaluation dimensions, weights, range, threshold
+### Q1: What does delivery read from state?
 
-| Dimension | Field | Weight | Score range |
-|---|---|---|---|
-| Factuality | `factuality_score` | 30% | 0.0–5.0 |
-| Citation alignment | `citation_alignment_score` | 25% | 0.0–5.0 |
-| Reasoning quality | `reasoning_score` | 20% | 0.0–5.0 |
-| Completeness | `completeness_score` | 15% | 0.0–5.0 |
-| Bias / balance | `bias_score` | 10% | 0.0–5.0 |
-
-Formula: `final_quality_score = 0.30*F + 0.25*C + 0.20*R + 0.15*Co + 0.10*B`
-
-Pass threshold: `final_quality_score >= 4.0` (enforced in `CriticOutput.__post_init__`).
-
-The LLM is instructed to return the 5 raw dimension scores only. Code computes
-`final_quality_score` and sets `passed` via `__post_init__` — LLM values for these
-fields are overridden and never trusted.
-
-### Q2: grounding_issues consumption
-
-- Critic reads `state["grounding_issues"]` (list[str]) as input context.
-- Presented to the LLM as a dedicated block: `KNOWN GROUNDING ISSUES:\n{issues}`
-- The critic does NOT re-verify grounding — it uses these as pre-computed facts that
-  inform its scoring (especially factuality and citation_alignment dimensions).
-- If `grounding_issues` is empty, the block is replaced with "(none — grounding check passed clean)".
-
-### Q3: CriticOutput structure (from state.py)
-
-```python
-@dataclass
-class CriticOutput:
-    factuality_score: float          # LLM-provided, 0.0–5.0
-    citation_alignment_score: float  # LLM-provided, 0.0–5.0
-    reasoning_score: float           # LLM-provided, 0.0–5.0
-    completeness_score: float        # LLM-provided, 0.0–5.0
-    bias_score: float                # LLM-provided, 0.0–5.0
-    final_quality_score: float       # CODE-COMPUTED — not trusted from LLM
-    issues: list[CriticIssue]        # specific problems identified
-    suggestions: list[CriticSuggestion]  # actionable improvements
-    passed: bool                     # __post_init__ sets this from final_quality_score >= 4.0
-```
-
-`CriticIssue`: `{issue_text: str, quote_from_synthesis: str, severity: IssueSeverity}`
-`CriticSuggestion`: `{action: str, target_section: str, new_evidence_needed: bool}`
-`IssueSeverity`: `Literal["critical", "major", "minor"]`
-
-### Q4: State fields written
-
-| Field | Written by critic | Notes |
+| Field | Read | Why |
 |---|---|---|
-| `critic_output` | ✅ always | Full CriticOutput with computed scores |
-| `total_tokens_used` | ✅ accumulated | `state value + tokens_from_llm` |
-| `grounding_issues` | ❌ not touched | Already written by grounding_check |
-| `revision_count` | ❌ not touched | Incremented by coordinator on PATH 2 |
-| `synthesis` | ❌ not touched | Modified by coordinator only |
+| `synthesis` | ✅ | Primary content: topic, executive_summary, findings, risks, gaps, citations |
+| `critic_output` | ✅ | Quality badge: `critic_output.passed` and `final_quality_score` |
+| `output_format` | ✅ | Dispatches to correct renderer |
+| `revision_count` | ✅ | Detects force-delivery case |
+| `cost_usd` | ❌ | Not user-facing |
+| `final_output` | ❌ | This is what we WRITE, not read |
+| `grounding_issues` | ❌ | Already incorporated into critic scoring |
 
-### Q5: Routing decision
+### Q2: What format(s) does it produce?
 
-`route_after_critic` in `graph/router.py` is **already fully implemented** — no changes needed.
+- `markdown`: Fully implemented via `render_markdown()` pure function.
+- `docx`, `pdf`, `pptx`: Raise `NotImplementedError("Format not yet implemented")` stubs.
 
-Priority order (already coded):
-1. `cost_usd > 0.75 * cost_ceiling_usd` → `"delivery"` (budget exhausted)
-2. `critic_output.passed == True` → `"delivery"` (quality threshold met)
-3. `revision_count >= 2` → `"delivery"` (hard cap; router forces delivery, quality caveat
-   already injected via `budget_gate_node` pattern if applicable)
-4. else → `"coordinator"` (trigger revision pass)
+**Why markdown only:** Other formats require external dependencies (python-docx, WeasyPrint, python-pptx) not yet integrated. Markdown is the dev-default format and serves as the reference renderer.
 
-### Q6: Revision count cap
+### Q3: State write
 
-The cap is enforced entirely by `route_after_critic` checking `revision_count >= _MAX_REVISIONS`.
-The critic node itself does NOT modify `revision_count` or inject quality caveats.
-Coordinator (PATH 2) increments `revision_count` by 1.
-If `revision_count == 2` and critic fails again, `route_after_critic` routes to "delivery"
-without a third coordinator call. No force-delivery caveat is written by the critic — that
-would require a separate node (out of scope for this plan).
+Returns `{"final_output": str}` — LangGraph merges this partial update into state.
 
-### Q7: route_after_critic changes needed
+### Q4: Force-delivery case
 
-**None.** The existing implementation is complete and correct. The new builder wiring must
-use `add_conditional_edges("budget_gate", route_after_critic, ...)` — that is a builder
-change, not a router change.
-
-### Q8: Token cost
-
-Typical call (synthesis with 3 findings, 2 grounding issues):
-
-| Token category | Estimate |
-|---|---|
-| Prompt template + rubric | ~600 tokens |
-| Synthesis: exec summary + 3 findings (body ~150 words each) | ~500 tokens |
-| Grounding issues (2 strings) | ~80 tokens |
-| Input total | **~1180 tokens** |
-| Output (5 scores + 2 issues + 2 suggestions) | **~350 tokens** |
-| **Total per call** | **~1530 tokens** |
-
-| Provider | Cost per call |
-|---|---|
-| Groq (llama-3.1-8b) | **~$0.00** (free tier) |
-| Anthropic (claude-sonnet-4-6) | **~$0.005** |
-| OpenRouter (varies) | **~$0.001–$0.005** |
-
-### Q9: Updated graph wiring
-
-```
-grounding_check → critic → budget_gate → conditional(route_after_critic)
-                                              ├── "delivery" → END (stub until delivery built)
-                                              └── "coordinator" (revision loop)
-```
-
-New `add_node` calls needed:
+**Detection:**
 ```python
-builder.add_node("critic", critic_node)  # type: ignore[arg-type]
+is_force_delivered = (
+    state["revision_count"] >= _MAX_REVISIONS
+    and state["critic_output"] is not None
+    and not state["critic_output"].passed
+)
 ```
 
-New edges:
+**Caveat text (exact):**
+```
+> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.
+```
+
+Injected at the very top of the markdown output, before the title.
+
+### Q5: LLM call?
+
+**None.** Zero LLM calls, zero token cost. No prompt file needed. No runtime context needed.
+
+### Q6: Graph wiring change in builder.py
+
 ```python
-builder.add_edge("grounding_check", "critic")
-builder.add_edge("critic", "budget_gate")
+# Add import:
+from agents.delivery import delivery_node
+
+# Add node:
+builder.add_node("delivery", delivery_node)
+
+# Update conditional edges (replace END stub):
 builder.add_conditional_edges(
     "budget_gate",
     route_after_critic,
-    {"delivery": END, "coordinator": "coordinator"},
+    {"delivery": "delivery", "coordinator": "coordinator"},
 )
+
+# Add terminal edge:
+builder.add_edge("delivery", END)
 ```
 
-Remove: `builder.add_edge("grounding_check", END)` (current stub).
-The "delivery" branch routes to END until delivery node is built.
+Remove: the `{"delivery": END, ...}` stub in the current conditional edges map.
+
+### Q7: Estimated token cost
+
+**$0.00** — pure formatting.
+
+### Q8: Tests
+
+24 test cases — see table below.
 
 ---
 
-## Files to create / modify
+## Files to Create / Modify
 
 | Path | Action |
 |---|---|
-| `agents/critic.py` | **Create** |
-| `prompts/critic_v1.txt` | **Create** — full text below |
-| `prompts/CHANGELOG.md` | **Update** |
-| `agents/__init__.py` | **Update** — export `critic_node` |
-| `graph/builder.py` | **Update** — wire grounding_check → critic → budget_gate → conditional |
-| `graph/router.py` | **No change** — already complete |
-| `tests/test_critic.py` | **Create** — 20+ tests |
+| `agents/delivery.py` | **Create** |
+| `agents/__init__.py` | **Update** — export `delivery_node` |
+| `graph/builder.py` | **Update** — wire delivery node, update conditional edges |
+| `tests/test_delivery.py` | **Create** — 24 tests |
 
 ---
 
-## Prompt file (full text)
-
-### `prompts/critic_v1.txt`
-
-```
-You are an adversarial research reviewer. Your task is to critically evaluate a research brief for factual accuracy, citation quality, reasoning soundness, completeness, and bias.
-
-SYNTHESIS TO REVIEW:
-{{synthesis_block}}
-
-KNOWN GROUNDING ISSUES (pre-checked by automated fact-checker):
-{{grounding_issues_block}}
-
-SCORING RUBRIC:
-Score each dimension from 0.0 to 5.0 (not an integer — use decimals):
-
-1. FACTUALITY (weight 30%): Are all factual claims accurate and traceable to the cited evidence? Deduct for claims that go beyond what the evidence supports. 5.0 = all claims verified; 0.0 = pervasive fabrication.
-
-2. CITATION_ALIGNMENT (weight 25%): Do the cited URLs match the claims they support? Deduct for citations that exist but don't support the specific claim made. Consider the KNOWN GROUNDING ISSUES above. 5.0 = perfect alignment; 0.0 = systematic hallucination.
-
-3. REASONING (weight 20%): Are the logical inferences from the evidence sound? Deduct for non-sequiturs, overgeneralizations, and unsupported causal claims. 5.0 = rigorous reasoning; 0.0 = fundamental logical errors.
-
-4. COMPLETENESS (weight 15%): Does the synthesis address the apparent research scope adequately? Deduct for significant omissions or gaps not acknowledged. 5.0 = comprehensive; 0.0 = critically incomplete.
-
-5. BIAS (weight 10%): Is the synthesis balanced? Deduct for selective use of evidence, framing that favors one position without acknowledging counterevidence, or missing "CONFLICT RULE" violations. 5.0 = balanced; 0.0 = highly biased.
-
-TASK:
-1. Score each of the 5 dimensions honestly. Be strict — a score of 4.0+ means the brief is ready for delivery.
-2. List specific issues (things that MUST be fixed in a revision). Only list issues worth a revision — trivial wording is not an issue.
-3. List actionable suggestions tied to specific sections.
-
-Return ONLY valid JSON — no preamble, no markdown fences, no explanation:
-
-{
-  "factuality_score": 4.2,
-  "citation_alignment_score": 3.8,
-  "reasoning_score": 4.5,
-  "completeness_score": 3.5,
-  "bias_score": 4.0,
-  "issues": [
-    {
-      "issue_text": "The claim that AUC >0.97 is not present in any cited source",
-      "quote_from_synthesis": "AI models achieve AUC >0.97 for pneumonia detection",
-      "severity": "critical"
-    }
-  ],
-  "suggestions": [
-    {
-      "action": "Replace AUC claim with the correct threshold from the NEJM source",
-      "target_section": "AI Matches Radiologist Accuracy in Chest X-Rays",
-      "new_evidence_needed": false
-    }
-  ]
-}
-
-severity must be exactly "critical", "major", or "minor".
-new_evidence_needed must be a boolean (true/false).
-```
-
----
-
-## TypedDicts for two-level deserialization
-
-```python
-class _RawCriticIssue(TypedDict):
-    issue_text: str
-    quote_from_synthesis: str
-    severity: str  # validated against IssueSeverity literals
-
-class _RawCriticSuggestion(TypedDict):
-    action: str
-    target_section: str
-    new_evidence_needed: bool
-
-class _RawCriticOutput(TypedDict):
-    factuality_score: float
-    citation_alignment_score: float
-    reasoning_score: float
-    completeness_score: float
-    bias_score: float
-    issues: list[_RawCriticIssue]
-    suggestions: list[_RawCriticSuggestion]
-```
-
----
-
-## Code outline (signatures + docstrings only)
+## Function Signatures (no implementation bodies)
 
 ```python
 """
-agents/critic.py
+agents/delivery.py
 
-Critic node: adversarial 5-dimension evaluation of the synthesis brief.
+Delivery node: format SynthesisOutput into the requested output format.
 
-Reads:  state["synthesis"], state["grounding_issues"]
-Writes: state["critic_output"], state["total_tokens_used"]
+Reads:  state["synthesis"], state["critic_output"], state["output_format"],
+        state["revision_count"]
+Writes: state["final_output"]
 
-Must run AFTER grounding_check (CLAUDE.md rule).
-Does NOT modify synthesis, revision_count, or grounding_issues.
-Routing to delivery or coordinator is handled by route_after_critic in graph/router.py.
+Pure formatting logic — no LLM calls, no token cost.
+No prompt file needed.
 """
 
-PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "critic_v1.txt"
-_SYNTHESIS_BLOCK_CAP = 6000  # chars
-_VALID_SEVERITIES: frozenset[str] = frozenset({"critical", "major", "minor"})
-
-
-def _is_anthropic(llm: BaseChatModel) -> bool: ...
-
-def _load_prompt(path: Path) -> str: ...
-
-def _serialize_synthesis(synthesis: SynthesisOutput) -> str:
-    """Serialize SynthesisOutput for the critic prompt.
-
-    Includes: topic, executive_summary, all findings (heading + body + evidence_refs),
-    risks, gaps. Caps at ~_SYNTHESIS_BLOCK_CAP chars per-item boundary.
-    """
-    ...
-
-def _serialize_grounding_issues(issues: list[str]) -> str:
-    """Return grounding issues as a numbered list, or
-    '(none — grounding check passed clean)' if empty.
-    """
-    ...
-
-def _build_messages(
-    synthesis_block: str,
-    grounding_issues_block: str,
-    prompt_template: str,
-    use_cache_control: bool = False,
-) -> list[BaseMessage]:
-    """Build messages for the critic LLM call.
-
-    use_cache_control=True (Anthropic): static prompt + rubric cached;
-      synthesis_block + grounding_issues_block in uncached dynamic block.
-    use_cache_control=False: plain string SystemMessage.
-    """
-    ...
-
-def _compute_final_score(raw: _RawCriticOutput) -> float:
-    """Compute weighted final_quality_score from 5 raw dimension scores.
-
-    Formula: 0.30*F + 0.25*C + 0.20*R + 0.15*Co + 0.10*B
-    Clamps each dimension to [0.0, 5.0] before weighting.
-    Does NOT use the LLM's own final_quality_score if present.
-    """
-    ...
-
-def _parse_critic_output(
-    raw: str,
-    computed_final_score: float | None = None,  # pass None to compute internally
-) -> CriticOutput:
-    """Parse LLM JSON and build a typed CriticOutput.
-
-    Steps:
-      1. parse_agent_json(raw, _RawCriticOutput)
-      2. Clamp all 5 dimension scores to [0.0, 5.0]
-      3. Validate each issue.severity against _VALID_SEVERITIES
-      4. Validate issues: issue_text and quote_from_synthesis not empty
-      5. Convert _RawCriticIssue → CriticIssue dataclass
-      6. Convert _RawCriticSuggestion → CriticSuggestion dataclass
-      7. Compute final_quality_score via _compute_final_score()
-      8. Build and return CriticOutput(... final_quality_score=computed, passed=<from __post_init__>)
-
-    Raises:
-        AgentParseError: If JSON malformed or validation fails.
-    """
-    ...
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type(
-        (AgentParseError, httpx.HTTPStatusError, httpx.TimeoutException)
-    ),
-    reraise=True,
+_QUALITY_CAVEAT_TEMPLATE: str = (
+    "> **QUALITY NOTICE:** This research brief was delivered after reaching "
+    "the maximum revision limit (2 revisions) without meeting the quality "
+    "threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.\n"
 )
-async def _call_llm(
-    messages: list[BaseMessage],
-    llm: BaseChatModel,
-) -> tuple[CriticOutput, int]:
-    """Call the LLM and parse/validate the critic response.
 
-    Returns: (CriticOutput, tokens_used).
+_MAX_REVISIONS: int = 2  # must match graph/router.py._MAX_REVISIONS
+
+
+def _is_force_delivered(state: ResearchAgentState) -> bool:
+    """Return True if revision_count >= 2 AND critic_output.passed == False."""
+    ...
+
+
+def _build_citation_map(citations: list[Evidence]) -> dict[str, int]:
+    """Build URL → 1-based footnote index mapping from synthesis.citations."""
+    ...
+
+
+def _render_finding(finding: Finding, citation_map: dict[str, int]) -> str:
+    """Render a single finding as markdown (### heading, body, [^N] refs)."""
+    ...
+
+
+def _render_citations_section(citations: list[Evidence]) -> str:
+    """Render the References section with footnote definitions.
+
+    Format: [^1]: [Source Title](URL) - Published: YYYY-MM-DD
+    Returns empty string if citations is empty.
     """
     ...
 
-async def critic_node(
+
+def _render_quality_badge(
+    critic_output: CriticOutput | None,
+    is_force_delivered: bool,
+) -> str:
+    """Render the quality badge line.
+
+    Outputs:
+      "**Quality: PASS** (4.25/5.0)"    — when critic_output.passed
+      "**Quality: REVIEW RECOMMENDED** (3.50/5.0)"  — when force-delivered
+      "**Quality: N/A**"                 — when critic_output is None
+    """
+    ...
+
+
+def render_markdown(
+    synthesis: SynthesisOutput,
+    critic_output: CriticOutput | None,
+    is_force_delivered: bool,
+) -> str:
+    """Render SynthesisOutput as a complete markdown document.
+
+    Pure function: no side effects, no LLM calls, deterministic output.
+
+    Section order:
+        1. Quality caveat (ONLY if force-delivered)
+        2. # {topic}
+        3. Quality badge line
+        4. ## Executive Summary
+        5. ## Key Findings (### per finding, [^N] footnote refs)
+        6. ## Risks  (omit if empty)
+        7. ## Known Gaps  (omit if empty)
+        8. ## References (footnote definitions, omit if no citations)
+    """
+    ...
+
+
+async def delivery_node(
     state: ResearchAgentState,
-    runtime: Runtime[NofrinContext],
-) -> dict[str, object]:
-    """LangGraph node: adversarial 5-dimension review of the synthesis.
+) -> dict[str, str]:
+    """LangGraph node: format synthesis into the requested output format.
 
-    Reads state["synthesis"] and state["grounding_issues"].
-    Calls llm_critic (most capable model) for scoring and issue identification.
-    Computes final_quality_score in code — never trusts LLM's own computation.
-    Always writes state["critic_output"].
-
-    Args:
-        state: ResearchAgentState. Reads: synthesis, grounding_issues, total_tokens_used.
-        runtime: Injected NofrinContext. Uses llm_critic.
-
-    Returns:
-        {"critic_output": CriticOutput, "total_tokens_used": int}
+    Note: no Runtime parameter — no LLM client needed.
 
     Raises:
         ValueError: If synthesis is None.
-        AgentParseError: After 3 failed LLM/parse attempts.
+        NotImplementedError: If output_format is "docx", "pdf", or "pptx".
     """
     ...
 ```
 
 ---
 
-## JSON contract
+## render_markdown() Output Specification
 
-**LLM must return (5 scores, issues, suggestions — no final_quality_score, no passed):**
-```json
-{
-  "factuality_score": 4.2,
-  "citation_alignment_score": 3.8,
-  "reasoning_score": 4.5,
-  "completeness_score": 3.5,
-  "bias_score": 4.0,
-  "issues": [
-    {
-      "issue_text": "The claim that AUC >0.97 is not present in any cited source",
-      "quote_from_synthesis": "AI models achieve AUC >0.97 for pneumonia detection",
-      "severity": "critical"
-    }
-  ],
-  "suggestions": [
-    {
-      "action": "Replace AUC claim with the correct threshold from the NEJM source",
-      "target_section": "AI Matches Radiologist Accuracy in Chest X-Rays",
-      "new_evidence_needed": false
-    }
-  ]
-}
+### Section order (exact)
+
+```
+1. [Quality caveat — only if force-delivered]
+2. # {topic}
+3. {quality_badge}
+4. ## Executive Summary
+   {executive_summary}
+5. ## Key Findings
+   ### {finding.heading}
+   {finding.body}[^i][^j]
+6. ## Risks         [omit if empty]
+   - {risk}
+7. ## Known Gaps    [omit if empty]
+   - {gap}
+8. ## References    [omit if no citations]
+   [^1]: [Title](URL) - Published: date
 ```
 
-**Code computes:**
-`final_quality_score = 0.30*4.2 + 0.25*3.8 + 0.20*4.5 + 0.15*3.5 + 0.10*4.0 = 4.075`
-`passed = (4.075 >= 4.0) = True`
+### Example (force-delivered, score 3.50)
+
+```markdown
+> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: 3.50/5.0). Review with appropriate scrutiny.
+
+# Renewable Energy Investment Trends 2025
+
+**Quality: REVIEW RECOMMENDED** (3.50/5.0)
+
+## Executive Summary
+
+Global renewable energy investments reached $500 billion in 2024...
+
+## Key Findings
+
+### Solar Costs Continue to Decline
+
+The levelized cost of solar energy dropped 12% year-over-year.[^1][^2]
+
+## Risks
+
+- Supply chain constraints may slow deployment in 2025
+
+## Known Gaps
+
+- Limited data on emerging markets
+
+## References
+
+[^1]: [IEA World Energy Outlook 2024](https://iea.org/reports/weo-2024) - Published: 2024-10-15
+[^2]: [BloombergNEF Solar Report](https://about.bnef.com/solar) - Published: 2024-09-20
+```
+
+### Example (passed, score 4.25)
+
+```markdown
+# Renewable Energy Investment Trends 2025
+
+**Quality: PASS** (4.25/5.0)
+
+## Executive Summary
+...
+```
 
 ---
 
-## State fields written
-
-| Field | Type | Always written |
-|---|---|---|
-| `critic_output` | `CriticOutput` | ✅ yes |
-| `total_tokens_used` | `int` | ✅ accumulated |
-
----
-
-## Tests — `tests/test_critic.py` (20 cases)
+## Test Cases (24)
 
 | # | Test | Assertion |
 |---|---|---|
-| 1 | `test_critic_node_returns_critic_output` | result contains "critic_output" key as CriticOutput |
-| 2 | `test_final_score_computed_not_from_llm` | LLM JSON has no `final_quality_score`; code computes it from the 5 scores |
-| 3 | `test_weighted_formula_correct` | scores (5,5,5,5,5) → final=5.0; scores (4,4,4,4,4) → final=4.0 |
-| 4 | `test_passed_true_when_score_gte_4` | final=4.075 → critic_output.passed == True |
-| 5 | `test_passed_false_when_score_lt_4` | final=3.5 → critic_output.passed == False |
-| 6 | `test_dimension_scores_clamped_to_0_5` | LLM returns score=6.0 → clamped to 5.0; score=-1.0 → 0.0 |
-| 7 | `test_critic_issues_are_criticissue_dataclasses` | all(isinstance(i, CriticIssue) for i in critic_output.issues) |
-| 8 | `test_critic_suggestions_are_criticsuggesion_dataclasses` | all(isinstance(s, CriticSuggestion) for s in critic_output.suggestions) |
-| 9 | `test_invalid_severity_raises_agent_parse_error` | issue.severity="INVALID" → AgentParseError |
-| 10 | `test_empty_issue_text_raises_agent_parse_error` | issue_text="" → AgentParseError |
-| 11 | `test_empty_quote_raises_agent_parse_error` | quote_from_synthesis="" → AgentParseError |
-| 12 | `test_synthesis_none_raises_value_error` | synthesis=None → ValueError before LLM call |
-| 13 | `test_grounding_issues_appear_in_serialized_context` | non-empty grounding_issues → block in message text |
-| 14 | `test_empty_grounding_issues_shows_clean_message` | grounding_issues=[] → "(none — grounding check passed clean)" in message |
-| 15 | `test_build_messages_anthropic_cache_control` | use_cache_control=True → list content with cache_control block |
-| 16 | `test_build_messages_groq_no_cache_control` | use_cache_control=False → plain str SystemMessage |
-| 17 | `test_retry_on_parse_failure` | LLM returns bad JSON once → retried → valid on 2nd call (2 ainvoke calls) |
-| 18 | `test_raises_after_max_retries` | LLM always returns bad JSON → AgentParseError after 3 attempts |
-| 19 | `test_total_tokens_accumulated` | state has 200 tokens; LLM response has 50 tokens → result is 250 |
-| 20 | `test_load_prompt_missing_file_raises` | _load_prompt(nonexistent_path) → FileNotFoundError |
+| 1 | `test_delivery_node_returns_final_output_key` | `"final_output" in result` |
+| 2 | `test_final_output_is_string` | `isinstance(result["final_output"], str)` |
+| 3 | `test_markdown_contains_topic_as_title` | `"# Test Topic"` in output |
+| 4 | `test_markdown_contains_executive_summary_heading` | `"## Executive Summary"` in output |
+| 5 | `test_markdown_contains_all_finding_headings` | All finding headings as `###` in output |
+| 6 | `test_findings_have_footnote_refs` | `[^1]` appears in finding body |
+| 7 | `test_risks_section_present_when_nonempty` | `"## Risks"` in output |
+| 8 | `test_gaps_section_present_when_nonempty` | `"## Known Gaps"` in output |
+| 9 | `test_citations_section_present` | `"## References"` and `[^1]:` in output |
+| 10 | `test_quality_badge_pass` | `"Quality: PASS"` in output when `critic_output.passed=True` |
+| 11 | `test_quality_badge_review_recommended` | `"Quality: REVIEW RECOMMENDED"` when force-delivered |
+| 12 | `test_force_delivery_caveat_injected_at_top` | `"QUALITY NOTICE:"` is first non-empty line |
+| 13 | `test_force_delivery_caveat_contains_score` | `"3.50/5.0"` in caveat string |
+| 14 | `test_no_caveat_when_critic_passed` | `"QUALITY NOTICE"` not in output |
+| 15 | `test_no_caveat_when_revision_under_cap` | `revision_count=1, passed=False` → no caveat |
+| 16 | `test_synthesis_none_raises_value_error` | `ValueError` before any rendering |
+| 17 | `test_output_format_markdown_produces_output` | `len(result["final_output"]) > 0` |
+| 18 | `test_output_format_docx_raises_not_implemented` | `NotImplementedError` |
+| 19 | `test_output_format_pdf_raises_not_implemented` | `NotImplementedError` |
+| 20 | `test_output_format_pptx_raises_not_implemented` | `NotImplementedError` |
+| 21 | `test_render_markdown_is_pure` | Same args → identical output on two calls |
+| 22 | `test_citations_format_url_and_title` | `[Title](URL)` pattern in References |
+| 23 | `test_empty_risks_omits_section` | `"## Risks"` NOT in output when `risks=[]` |
+| 24 | `test_empty_gaps_omits_section` | `"## Known Gaps"` NOT in output when `gaps=[]` |
 
 ---
 
-## Failure modes
+## Failure Modes
 
 | Failure | Cause | Mitigation |
 |---|---|---|
-| `synthesis is None` | Bug: critic called before coordinator | `ValueError` before any LLM call |
-| LLM returns final_quality_score / passed | LLM follows prompt poorly | Both fields computed in code; LLM values silently overridden by `__post_init__` |
-| LLM returns score > 5.0 or < 0.0 | Hallucination | `_compute_final_score` clamps each dimension to [0.0, 5.0] |
-| Invalid severity string | LLM invents severity level | Whitelist check in `_parse_critic_output` → AgentParseError → retry |
-| Empty issue_text or quote | Malformed partial response | Validated in `_parse_critic_output` → AgentParseError → retry |
-| Synthesis too long for context | Many large findings | `_serialize_synthesis` caps at _SYNTHESIS_BLOCK_CAP chars per-item |
-| All 3 retries fail | Systematic LLM failure | `reraise=True` propagates `AgentParseError` |
-| Prompt file missing | Deployment error | `FileNotFoundError` with clear message |
-| issues=[] when there are real problems | LLM too lenient | Downstream revision loop limited to 2 cycles; acceptable risk |
+| `synthesis is None` | delivery called before coordinator | `ValueError` |
+| `critic_output is None` | edge case — critic skipped | Badge shows `N/A` |
+| Unsupported `output_format` | docx/pdf/pptx request | `NotImplementedError` |
+| Empty `findings` | coordinator edge case | `## Key Findings` section renders empty |
+| URL not in `citation_map` | evidence_ref not in citations | Append URL inline without footnote |
+| `revision_count > _MAX_REVISIONS` | router bug | `>= 2` check still fires correctly |
 
 ---
 
-## Architect notes
+## Architect Notes
 
-1. **No route_after_critic changes needed.** The function already handles all 4 priority cases.
+1. **No `runtime` parameter** — same pattern as `boundary_compressor_node`. Signature is `async def delivery_node(state: ResearchAgentState) -> dict[str, str]`.
 
-2. **builder.py conditional edges** require the "delivery" stub to route to END until the
-   delivery node is implemented. Use `{"delivery": END, "coordinator": "coordinator"}` as
-   the path map in `add_conditional_edges`.
+2. **`_MAX_REVISIONS = 2`** — must be kept in sync with `graph/router.py._MAX_REVISIONS`. Do not import from router (circular import risk); declare as a local constant.
 
-3. **`_RawCriticOutput` intentionally omits `final_quality_score` and `passed`** — the LLM
-   does not return these, and even if it did, they'd be overridden by `__post_init__`.
-   If the LLM includes extra keys, `TypedDict(**data)` silently accepts them (they're just dicts).
+3. **`render_markdown` exported** — for direct testing and future reuse by docx/pptx renderers as a reference.
 
-4. **Score computation separation**: `_compute_final_score` is a pure function (no LLM call,
-   no side effects) — easy to unit test independently without mocking.
+4. **Section blank lines** — separate each section with a double newline (`\n\n`) for valid markdown rendering.
 
-5. **grounding_issues informs scoring**: the prompt explicitly tells the LLM to use grounding
-   issues when scoring citation_alignment. This is the primary linkage between grounding_check
-   and critic — no direct code dependency, only via state.
+5. **Footnote refs in findings** — only include `[^N]` for URLs present in `citation_map`; silently skip unknown refs.

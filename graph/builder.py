@@ -3,10 +3,10 @@ graph/builder.py
 
 LangGraph workflow assembly for the Deep Research Agent.
 
-Current wiring (Phase 4 — nodes implemented so far):
+Current wiring (Phase 5 — nodes implemented so far):
   START → supervisor → boundary_compressor → coordinator → grounding_check
         → critic → budget_gate → conditional(route_after_critic)
-              ├── "delivery" → END  (stub until delivery node is built)
+              ├── "delivery" → END
               └── "coordinator"     (revision loop, max 2)
 
 Planned full wiring (Phase 1 complete):
@@ -72,6 +72,7 @@ def build_graph() -> CompiledStateGraph:  # type: ignore[type-arg]
 
     from agents.coordinator import coordinator_node
     from agents.critic import critic_node
+    from agents.delivery import delivery_node
     from agents.grounding_check import grounding_check_node
     from agents.supervisor import supervisor_node
     from graph.boundary_compressor import boundary_compressor_node
@@ -83,13 +84,11 @@ def build_graph() -> CompiledStateGraph:  # type: ignore[type-arg]
     builder.add_node("grounding_check", grounding_check_node)  # type: ignore[arg-type]
     builder.add_node("critic", critic_node)  # type: ignore[arg-type]
     builder.add_node("budget_gate", budget_gate_node)  # type: ignore[arg-type]
+    builder.add_node("delivery", delivery_node)  # type: ignore[arg-type]
 
     # TODO: add as implemented
     # from agents.worker import worker_node
-    # from agents.delivery import delivery_node
-    #
     # builder.add_node("worker", worker_node, cache_policy=CachePolicy(ttl=300))
-    # builder.add_node("delivery", delivery_node)
 
     # ── Edges ─────────────────────────────────────────────────────────────────
 
@@ -102,17 +101,13 @@ def build_graph() -> CompiledStateGraph:  # type: ignore[type-arg]
     builder.add_conditional_edges(
         "budget_gate",
         route_after_critic,  # type: ignore[arg-type]
-        {"delivery": END, "coordinator": "coordinator"},
+        {"delivery": "delivery", "coordinator": "coordinator"},
     )
+    builder.add_edge("delivery", END)
 
     # TODO: Phase 2 — replace supervisor→boundary_compressor with Send() fan-out:
     #   builder.add_conditional_edges("supervisor", dispatch_workers, ["worker"])
     #   builder.add_edge("worker", "boundary_compressor")   # fan-in via operator.add
-    #
-    # TODO: Phase 5 — replace "delivery" END stub with delivery node:
-    #   builder.add_node("delivery", delivery_node)
-    #   # update conditional_edges map: {"delivery": "delivery", "coordinator": "coordinator"}
-    #   builder.add_edge("delivery", END)
 
     return builder.compile()
 

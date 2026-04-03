@@ -33,7 +33,6 @@ from graph.state import (
     Finding,
     ResearchAgentState,
     SynthesisOutput,
-    WorkerResult,
 )
 from graph.utils import AgentParseError
 
@@ -493,7 +492,10 @@ def test_grounding_issues_appear_in_serialized_context() -> None:
     """13. non-empty grounding_issues → block in message text."""
     from agents.critic import _serialize_grounding_issues
 
-    issues = ["[UNSUPPORTED] Finding: 'X' — desc", "[MISSING_CITATION] Finding: 'Y' — desc"]
+    issues = [
+        "[UNSUPPORTED] Finding: 'X' — desc",
+        "[MISSING_CITATION] Finding: 'Y' — desc",
+    ]
     result = _serialize_grounding_issues(issues)
 
     assert "[UNSUPPORTED]" in result
