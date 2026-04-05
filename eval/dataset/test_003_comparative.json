@@ -1,0 +1,9 @@
+{
+  "id": "test_003",
+  "query": "Compare nuclear energy and offshore wind energy as pathways to decarbonization.",
+  "intent_type": "comparative",
+  "expected_findings_keywords": ["levelized cost", "capacity factor", "construction time", "land use", "waste", "intermittency"],
+  "forbidden_claims": ["nuclear energy is entirely risk-free", "wind energy has zero environmental impact"],
+  "expected_gaps_acknowledged": true,
+  "minimum_citations": 2
+}

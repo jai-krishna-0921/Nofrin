@@ -1,0 +1,9 @@
+{
+  "id": "test_001",
+  "query": "What is the CRISPR-Cas9 mechanism and how is it used in gene editing?",
+  "intent_type": "factual",
+  "expected_findings_keywords": ["guide RNA", "double-strand break", "Cas9 protein", "DNA repair", "off-target"],
+  "forbidden_claims": ["CRISPR cures all diseases", "CRISPR is completely safe with no risks"],
+  "expected_gaps_acknowledged": false,
+  "minimum_citations": 2
+}

@@ -1,0 +1,9 @@
+{
+  "id": "test_002",
+  "query": "What are the long-term societal impacts of widespread autonomous vehicle adoption?",
+  "intent_type": "exploratory",
+  "expected_findings_keywords": ["employment", "urban planning", "insurance", "liability", "infrastructure"],
+  "forbidden_claims": ["autonomous vehicles will be fully deployed by 2025"],
+  "expected_gaps_acknowledged": true,
+  "minimum_citations": 2
+}

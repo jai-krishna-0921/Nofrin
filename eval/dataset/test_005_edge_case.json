@@ -1,0 +1,9 @@
+{
+  "id": "test_005",
+  "query": "What are the documented side effects of the drug Tafamidis in transthyretin amyloid cardiomyopathy treatment?",
+  "intent_type": "factual",
+  "expected_findings_keywords": ["transthyretin", "cardiomyopathy", "clinical trial", "ATTR-CM"],
+  "forbidden_claims": ["Tafamidis has no side effects", "Tafamidis cures amyloidosis"],
+  "expected_gaps_acknowledged": true,
+  "minimum_citations": 1
+}
