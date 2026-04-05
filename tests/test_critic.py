@@ -445,8 +445,8 @@ def test_empty_issue_text_raises_agent_parse_error() -> None:
         _parse_critic_output(raw_json)
 
 
-def test_empty_quote_raises_agent_parse_error() -> None:
-    """11. quote_from_synthesis="" → AgentParseError."""
+def test_empty_quote_uses_placeholder() -> None:
+    """11. quote_from_synthesis="" → issue is kept with placeholder, no crash."""
     raw_json = json.dumps(
         {
             "factuality_score": 4.0,
@@ -465,8 +465,9 @@ def test_empty_quote_raises_agent_parse_error() -> None:
         }
     )
 
-    with pytest.raises(AgentParseError, match="empty quote_from_synthesis"):
-        _parse_critic_output(raw_json)
+    result = _parse_critic_output(raw_json)
+    assert len(result.issues) == 1
+    assert result.issues[0].quote_from_synthesis == "(no quote provided)"
 
 
 @pytest.mark.asyncio

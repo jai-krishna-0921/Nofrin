@@ -25,7 +25,12 @@ import os
 import sys
 import uuid
 
+from dotenv import load_dotenv
+
+load_dotenv()
+
 from graph.builder import build_graph
+from graph.progress import pipeline_done, pipeline_start
 from graph.context import NofrinContext
 from graph.llm import get_llm
 from graph.state import OutputFormat, ResearchAgentState
@@ -105,20 +110,25 @@ async def _run(
     context = _build_context(session_id)
     initial_state = _build_initial_state(query, output_format, session_id)
 
+    pipeline_start(query)
     result: dict[str, object] = await graph.ainvoke(  # type: ignore[call-overload]
         initial_state,
         context=context,
     )
 
     final_output = result.get("final_output")
+    cost_raw = result.get("cost_usd")
+    tokens_raw = result.get("total_tokens_used")
+    cost: float = float(cost_raw) if isinstance(cost_raw, (int, float)) else 0.0
+    tokens: int = int(tokens_raw) if isinstance(tokens_raw, int) else 0
+
     if isinstance(final_output, str) and final_output:
+        pipeline_done(cost, tokens)
         print(final_output)
     else:
         print("[No output produced]", file=sys.stderr)
         return 1
 
-    cost = result.get("cost_usd", 0.0)
-    tokens = result.get("total_tokens_used", 0)
     print(f"cost_usd={cost:.4f} total_tokens={tokens}", file=sys.stderr)
     return 0
 

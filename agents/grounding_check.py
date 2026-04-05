@@ -28,6 +28,7 @@ from tenacity import (
 )
 
 from graph.context import NofrinContext
+from graph.progress import grounding_done, grounding_start
 from graph.state import (
     Evidence,
     Finding,
@@ -404,7 +405,10 @@ async def grounding_check_node(
 
     # Fast path: nothing to check.
     if not synthesis.findings:
+        grounding_done(0)
         return {"grounding_issues": []}
+
+    grounding_start(len(synthesis.findings))
 
     # Build URL → Evidence lookup from compressed worker results.
     evidence_by_url: dict[str, Evidence] = {}
@@ -421,6 +425,7 @@ async def grounding_check_node(
     messages = _build_messages(findings_block, prompt_template, _is_anthropic(llm))
 
     issues = await _call_llm(messages, llm)
+    grounding_done(len(issues))
     return {"grounding_issues": issues}
 
 

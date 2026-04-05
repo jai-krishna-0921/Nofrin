@@ -29,6 +29,7 @@ from tenacity import (
 )
 
 from graph.context import NofrinContext
+from graph.progress import critic_done, critic_start
 from graph.state import (
     CriticIssue,
     CriticOutput,
@@ -345,10 +346,13 @@ def _parse_critic_output(raw: str) -> CriticOutput:
             raise AgentParseError(
                 f"Issue {i} has an empty issue_text — required field."
             )
+        # quote_from_synthesis is required but the LLM occasionally omits it.
+        # Rather than crashing the pipeline, substitute a placeholder and log.
         if not quote.strip():
-            raise AgentParseError(
-                f"Issue {i} has an empty quote_from_synthesis — required field."
+            logger.warning(
+                "Issue %d has an empty quote_from_synthesis — using placeholder.", i
             )
+            quote = "(no quote provided)"
 
         issues.append(
             CriticIssue(
@@ -488,6 +492,7 @@ async def critic_node(
     llm: BaseChatModel = runtime.context.llm_critic
     prompt_template = _load_prompt(PROMPT_PATH)
 
+    critic_start(state["revision_count"])
     synthesis_block = _serialize_synthesis(synthesis)
     grounding_issues_block = _serialize_grounding_issues(grounding_issues)
     messages = _build_messages(
@@ -498,6 +503,11 @@ async def critic_node(
     )
 
     critic_output, tokens_used = await _call_llm(messages, llm)
+    critic_done(
+        critic_output.final_quality_score,
+        critic_output.passed,
+        len(critic_output.issues),
+    )
 
     current_tokens: int = state["total_tokens_used"]
     return {

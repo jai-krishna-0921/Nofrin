@@ -13,6 +13,7 @@ No prompt file needed. No runtime context needed.
 
 from __future__ import annotations
 
+from graph.progress import delivery_done, delivery_start
 from graph.state import (
     CriticOutput,
     Evidence,
@@ -315,6 +316,7 @@ async def delivery_node(
     output_format = state["output_format"]
     force_delivered = _is_force_delivered(state)
 
+    delivery_start(str(output_format))
     if output_format == "markdown":
         final_output = render_markdown(synthesis, critic_output, force_delivered)
     elif output_format == "docx":
@@ -326,6 +328,7 @@ async def delivery_node(
     else:
         raise NotImplementedError(f"Unknown output_format: {output_format!r}")
 
+    delivery_done(str(output_format), len(final_output))
     return {"final_output": final_output}
 
 

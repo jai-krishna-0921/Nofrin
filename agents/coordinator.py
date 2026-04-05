@@ -15,6 +15,7 @@ Writes: state["synthesis"], state["prior_syntheses"] (PATH 2 only),
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TypedDict
 
@@ -30,6 +31,7 @@ from tenacity import (
 )
 
 from graph.context import NofrinContext
+from graph.progress import coordinator_done, coordinator_start
 from graph.state import (
     CriticIssue,
     Evidence,
@@ -44,6 +46,8 @@ FIRST_PASS_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "coordinator
 REVISION_PROMPT_PATH = (
     Path(__file__).parent.parent / "prompts" / "coordinator_revision_v2.txt"
 )
+
+logger = logging.getLogger(__name__)
 
 # Total character cap across all serialized evidence items.
 # Each item is either fully included or fully excluded (no mid-item truncation).
@@ -366,14 +370,23 @@ def _parse_and_validate(
                 "at least 1 required."
             )
 
+        valid_refs: list[str] = []
         for ref in refs:
-            if ref not in available_urls:
-                raise AgentParseError(
-                    f"Finding {i} references URL '{ref}' which is not in the "
-                    "available evidence — possible hallucinated citation."
+            if ref in available_urls:
+                valid_refs.append(ref)
+            else:
+                logger.warning(
+                    "Finding %d: URL '%s' not in available evidence — dropping ref.",
+                    i,
+                    ref,
                 )
+        if not valid_refs:
+            raise AgentParseError(
+                f"Finding {i} ('{heading[:40]}') has no valid evidence_refs after "
+                "dropping hallucinated citations — retrying."
+            )
 
-        findings.append(Finding(heading=heading, body=body, evidence_refs=refs))
+        findings.append(Finding(heading=heading, body=body, evidence_refs=valid_refs))
 
     # Map citation_urls → real Evidence objects from compressed_worker_results.
     # Unknown URLs (not in available_urls) are silently excluded — they are a
@@ -521,6 +534,8 @@ async def coordinator_node(
     evidence_block = _serialize_evidence(worker_results)
     use_cache = _is_anthropic(llm)
 
+    coordinator_start(revision_count, len(worker_results))
+
     if revision_count == 0:
         # ── PATH 1: first-pass synthesis ─────────────────────────────────────
         prompt_template = _load_prompt(FIRST_PASS_PROMPT_PATH)
@@ -535,8 +550,10 @@ async def coordinator_node(
             synthesis_version=1,
             prior_attempt_summary=None,
         )
+        coordinator_done(len(synthesis.findings), tokens)
         return {
             "synthesis": synthesis,
+            "revision_count": 1,  # marks first-pass as done; PATH 2 triggers on next call
             "total_tokens_used": state["total_tokens_used"] + tokens,
         }
 
@@ -592,6 +609,7 @@ async def coordinator_node(
         synthesis_version=synthesis_version,
         prior_attempt_summary=prior_attempt_summary,
     )
+    coordinator_done(len(synthesis.findings), tokens)
 
     return {
         "synthesis": synthesis,

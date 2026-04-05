@@ -33,6 +33,13 @@ from tenacity import (
 )
 
 from graph.context import NofrinContext
+from graph.progress import (
+    worker_done,
+    worker_exa_results,
+    worker_exa_search,
+    worker_url_fail,
+    worker_url_ok,
+)
 from graph.state import Evidence, SourceType, WorkerInput, WorkerResult
 from graph.utils import AgentParseError, parse_agent_json
 
@@ -49,6 +56,10 @@ def _is_anthropic(llm: BaseChatModel) -> bool:
 
 logger = logging.getLogger(__name__)
 PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "worker_v1.txt"
+
+# Limit concurrent LLM calls to avoid Groq / OpenRouter rate-limit 429s.
+# All evidence extractions across all parallel workers share this semaphore.
+_LLM_SEMAPHORE = asyncio.Semaphore(3)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +246,8 @@ async def _search_exa(
     """
     params = _get_exa_params(sub_query, source_type)
     response = await exa_client.search_and_contents(sub_query, **params)
-    return list(response.results)
+    results = list(response.results)
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +319,8 @@ async def _extract_evidence_from_result(
         use_cache_control=_is_anthropic(llm),
     )
 
-    response = await llm.ainvoke(messages)
+    async with _LLM_SEMAPHORE:
+        response = await llm.ainvoke(messages)
     raw: str = str(response.content)
 
     tokens_used: int = 0
@@ -342,6 +355,7 @@ async def _extract_all_evidence(
     exa_results: list[object],
     sub_query: str,
     llm: BaseChatModel,
+    worker_id: str = "",
 ) -> tuple[list[Evidence], int]:
     """Process all Exa results in parallel via asyncio.gather().
 
@@ -355,6 +369,7 @@ async def _extract_all_evidence(
         exa_results: List of Exa result objects from _search_exa.
         sub_query: The sub-query these results were retrieved for.
         llm: Pre-configured LLM client from NofrinContext.
+        worker_id: Worker identifier for progress logging.
 
     Returns:
         Tuple of (list[Evidence], total_tokens_used).
@@ -362,6 +377,7 @@ async def _extract_all_evidence(
     if not exa_results:
         return [], 0
 
+    worker_exa_results(worker_id, len(exa_results))
     prompt_template = _load_prompt()
 
     coros = [
@@ -376,6 +392,7 @@ async def _extract_all_evidence(
     total_tokens = 0
 
     for i, outcome in enumerate(outcomes):
+        url = str(getattr(exa_results[i], "url", "") or "")
         if isinstance(outcome, BaseException):
             logger.warning(
                 "Evidence extraction failed for result %d of sub-query '%s': %s",
@@ -383,9 +400,11 @@ async def _extract_all_evidence(
                 sub_query,
                 outcome,
             )
+            worker_url_fail(worker_id, url, str(outcome))
             continue
         evidence, tokens = outcome
         if evidence.claim:  # filter empty-claim sentinel
+            worker_url_ok(worker_id, url, evidence.claim)
             evidence_items.append(evidence)
         total_tokens += tokens
 
@@ -443,12 +462,14 @@ async def worker_node(
     exa_client: AsyncExa = runtime.context.exa_client
     llm: BaseChatModel = runtime.context.llm_worker
 
+    worker_exa_search(worker_id, sub_query, str(source_type))
     exa_results = await _search_exa(exa_client, sub_query, source_type)
     raw_search_results = [_exa_result_to_dict(r) for r in exa_results]
 
     evidence_items, tokens_used = await _extract_all_evidence(
-        exa_results, sub_query, llm
+        exa_results, sub_query, llm, worker_id
     )
+    worker_done(worker_id, len(evidence_items), tokens_used)
 
     return {
         "worker_results": [

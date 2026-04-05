@@ -227,8 +227,8 @@ async def test_first_pass_does_not_modify_prior_syntheses() -> None:
 
 
 @pytest.mark.asyncio
-async def test_first_pass_does_not_increment_revision_count() -> None:
-    """4. 'revision_count' NOT in result."""
+async def test_first_pass_sets_revision_count_to_one() -> None:
+    """4. First-pass coordinator sets revision_count=1 so the next call takes PATH 2."""
     state = make_state(revision_count=0)
     worker_results = state["compressed_worker_results"]
 
@@ -241,7 +241,7 @@ async def test_first_pass_does_not_increment_revision_count() -> None:
 
     result = await coordinator_node(state, runtime)
 
-    assert "revision_count" not in result
+    assert result["revision_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -574,7 +574,8 @@ async def test_topic_populated() -> None:
 
 
 def test_invalid_evidence_ref_raises_agent_parse_error() -> None:
-    """17. evidence_ref URL not in available_urls -> AgentParseError raised."""
+    """17. All evidence_refs invalid -> AgentParseError raised (finding has zero valid refs).
+    Mixed case (some valid, some not) should succeed and drop only the bad ones."""
     raw_json = json.dumps(
         {
             "topic": "Test",
@@ -594,8 +595,34 @@ def test_invalid_evidence_ref_raises_agent_parse_error() -> None:
     available_urls: set[str] = {"http://valid.com"}
     evidence_by_url: dict[str, Evidence] = {}
 
-    with pytest.raises(AgentParseError, match="not in the available evidence"):
+    # All refs are bad → finding ends up with zero valid refs → raises
+    with pytest.raises(AgentParseError, match="no valid evidence_refs"):
         _parse_and_validate(raw_json, available_urls, evidence_by_url, 1, None)
+
+
+def test_mixed_evidence_refs_drops_bad_keeps_good() -> None:
+    """17b. Finding with one valid and one hallucinated ref → bad ref dropped, no crash."""
+    raw_json = json.dumps(
+        {
+            "topic": "Test",
+            "executive_summary": "Summary.",
+            "findings": [
+                {
+                    "heading": "Finding",
+                    "body": "Body",
+                    "evidence_refs": ["http://valid.com", "http://hallucinated.com"],
+                }
+            ],
+            "risks": [],
+            "gaps": [],
+            "citation_urls": [],
+        }
+    )
+    available_urls: set[str] = {"http://valid.com"}
+    evidence_by_url: dict[str, Evidence] = {}
+
+    result = _parse_and_validate(raw_json, available_urls, evidence_by_url, 1, None)
+    assert result.findings[0].evidence_refs == ["http://valid.com"]
 
 
 def test_empty_executive_summary_raises_agent_parse_error() -> None:

@@ -40,7 +40,8 @@
       "Bash(mypy agents/critic.py tests/test_critic.py --strict)",
       "Bash(mypy:*)",
       "WebFetch(domain:reference.langchain.com)",
-      "Bash(pytest:*)"
+      "Bash(pytest:*)",
+      "Bash(jobs)"
     ]
   }
 }

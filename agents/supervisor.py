@@ -28,6 +28,7 @@ from tenacity import (
 )
 
 from graph.context import NofrinContext
+from graph.progress import supervisor_done, supervisor_start
 from graph.state import IntentType, ResearchAgentState, SourceType
 from graph.utils import AgentParseError, parse_agent_json
 
@@ -312,10 +313,13 @@ async def supervisor_node(
     if not user_query:
         raise ValueError("state['user_query'] must not be empty.")
 
+    supervisor_start(user_query)
     output = await _call_llm(user_query, runtime.context.llm_supervisor)
+    sub_queries = [sq.query for sq in output.sub_queries]
+    supervisor_done(str(output.intent_type), sub_queries)
 
     return {
         "intent_type": output.intent_type,
-        "sub_queries": [sq.query for sq in output.sub_queries],
+        "sub_queries": sub_queries,
         "source_routing": {sq.query: sq.source_type for sq in output.sub_queries},
     }
