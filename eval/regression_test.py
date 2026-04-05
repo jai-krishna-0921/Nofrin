@@ -40,7 +40,9 @@ _CASES = _baseline_cases()
 
 
 @pytest.mark.eval
-@pytest.mark.skipif(len(_CASES) == 0, reason="All baselines are null — nothing to regress against")
+@pytest.mark.skipif(
+    len(_CASES) == 0, reason="All baselines are null — nothing to regress against"
+)
 @pytest.mark.parametrize("test_id,metric,baseline", _CASES)
 def test_score_does_not_regress(
     test_id: str,

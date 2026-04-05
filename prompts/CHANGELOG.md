@@ -42,6 +42,14 @@
 - **Why**: Baseline — first implementation
 - **Eval delta**: N/A (baseline)
 
+## coordinator_revision_v2.txt
+- **Date**: 2026-04-05
+- **What**: Added `Revision {{revision_count}} of 2` counter + final-pass directive at top: "If this is revision 2, resolve ALL remaining issues — do not defer to gaps[] unless the evidence genuinely does not support resolution." `coordinator.py` updated: `_build_revision_messages` gains `revision_count: int` parameter; `.replace("{{revision_count}}", str(revision_count))` added to filled chain and cache_control branch; call site updated; `REVISION_PROMPT_PATH` points to v2.
+- **Why**: LLM had no visibility into revision budget; on the final pass it was deferring resolvable issues to gaps[] unnecessarily because it didn't know it was the last chance to fix them.
+- **Eval delta**: TBD (run `pytest eval/` after baseline is measured)
+
+---
+
 ## Template for new entries
 
 ```

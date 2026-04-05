@@ -42,7 +42,7 @@ from graph.utils import AgentParseError, parse_agent_json
 
 FIRST_PASS_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "coordinator_v1.txt"
 REVISION_PROMPT_PATH = (
-    Path(__file__).parent.parent / "prompts" / "coordinator_revision_v1.txt"
+    Path(__file__).parent.parent / "prompts" / "coordinator_revision_v2.txt"
 )
 
 # Total character cap across all serialized evidence items.
@@ -245,6 +245,7 @@ def _build_revision_messages(
     evidence_block: str,
     prior_synthesis_block: str,
     critic_issues_block: str,
+    revision_count: int,
     prompt_template: str,
     use_cache_control: bool = False,
 ) -> list[BaseMessage]:
@@ -260,7 +261,8 @@ def _build_revision_messages(
         evidence_block: Serialized evidence from _serialize_evidence().
         prior_synthesis_block: Serialized text of the prior SynthesisOutput.
         critic_issues_block: Serialized issues from _serialize_critic_issues().
-        prompt_template: Loaded coordinator_revision_v1.txt template.
+        revision_count: Current revision number (1-based for display).
+        prompt_template: Loaded coordinator_revision_v2.txt template.
         use_cache_control: Pass True only for Anthropic providers.
 
     Returns:
@@ -275,7 +277,9 @@ def _build_revision_messages(
         content_blocks: list[dict[str, object]] = [
             {
                 "type": "text",
-                "text": prompt_template,
+                "text": prompt_template.replace(
+                    "{{revision_count}}", str(revision_count)
+                ),
                 "cache_control": {"type": "ephemeral"},
             },
             {
@@ -288,6 +292,7 @@ def _build_revision_messages(
         prompt_template.replace("{{evidence_block}}", evidence_block)
         .replace("{{prior_synthesis_block}}", prior_synthesis_block)
         .replace("{{critic_issues_block}}", critic_issues_block)
+        .replace("{{revision_count}}", str(revision_count))
     )
     return [SystemMessage(content=filled)]
 
@@ -574,6 +579,7 @@ async def coordinator_node(
         evidence_block,
         prior_synthesis_block,
         critic_issues_block,
+        revision_count,
         prompt_template,
         use_cache,
     )

@@ -10,7 +10,7 @@ import pytest
 from langgraph.types import Send
 
 from graph.router import dispatch_workers
-from graph.state import ResearchAgentState, SourceType, WorkerInput
+from graph.state import ResearchAgentState, SourceType
 
 
 # ---------------------------------------------------------------------------

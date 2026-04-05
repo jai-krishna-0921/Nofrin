@@ -64,7 +64,7 @@ async def _run_pipeline(query: str, output_format: str = "markdown") -> str | No
     from graph.builder import build_graph
     from graph.context import NofrinContext
     from graph.llm import get_llm
-    from graph.state import OutputFormat, ResearchAgentState
+    from graph.state import ResearchAgentState
 
     try:
         from exa_py import AsyncExa  # noqa: PLC0415

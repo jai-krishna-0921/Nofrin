@@ -872,6 +872,7 @@ def test_build_revision_messages_groq_no_cache_control() -> None:
         evidence_block="evidence",
         prior_synthesis_block="prior",
         critic_issues_block="issues",
+        revision_count=1,
         prompt_template=(
             "prompt with {{evidence_block}} {{prior_synthesis_block}} {{critic_issues_block}}"
         ),
