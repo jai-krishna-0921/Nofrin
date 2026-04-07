@@ -109,6 +109,7 @@ def build_state(
         user_query="test query",
         intent_type="factual",
         output_format=output_format,  # type: ignore[typeddict-item]
+        research_mode="research",
         sub_queries=["sub query 1"],
         source_routing={"sub query 1": "web"},
         worker_results=[],

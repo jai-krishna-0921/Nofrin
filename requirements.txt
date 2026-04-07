@@ -27,6 +27,7 @@ orjson==3.11.7
 
 # ── Search (Phase 1+) ─────────────────────────────────────────────────────────
 exa-py           # AsyncExa used in agents/worker.py
+tavily-python    # AsyncTavilyClient used in agents/worker.py (fast mode web/news)
 
 # ── Dev tooling ───────────────────────────────────────────────────────────────
 pytest==9.0.2

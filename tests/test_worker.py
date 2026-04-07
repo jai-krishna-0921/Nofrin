@@ -17,12 +17,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from agents.worker import (
+    _TavilyResult,
     _build_exa_params_academic,
     _build_exa_params_news,
     _build_exa_params_web,
     _build_extraction_messages,
     _extract_all_evidence,
     _get_exa_params,
+    _search_tavily,
+    _select_provider,
     worker_node,
 )
 from graph.context import NofrinContext
@@ -78,12 +81,15 @@ def make_llm_response(
     return response
 
 
-def make_worker_state(source_type: str = "web") -> WorkerInput:
+def make_worker_state(
+    source_type: str = "web", research_mode: str = "research"
+) -> WorkerInput:
     """Create a minimal WorkerInput TypedDict."""
     return WorkerInput(
         worker_id="worker-123",
         sub_query="test query about renewables",
         source_type=source_type,  # type: ignore[typeddict-item]
+        research_mode=research_mode,  # type: ignore[typeddict-item]
     )
 
 
@@ -120,6 +126,8 @@ def mock_runtime() -> MagicMock:
     mock_llm = MagicMock()
     mock_llm.ainvoke = AsyncMock(return_value=make_llm_response())
     runtime.context.llm_worker = mock_llm
+    runtime.context.tavily_client = None
+    runtime.context.brave_api_key = None
 
     return runtime
 
@@ -139,6 +147,8 @@ def mock_runtime_no_results() -> MagicMock:
     mock_llm = MagicMock()
     mock_llm.ainvoke = AsyncMock(return_value=make_llm_response())
     runtime.context.llm_worker = mock_llm
+    runtime.context.tavily_client = None
+    runtime.context.brave_api_key = None
 
     return runtime
 
@@ -617,3 +627,181 @@ def test_build_extraction_messages_groq_no_cache_control() -> None:
     assert "Source Title" in content
     assert "Result text." in content
     assert "cache_control" not in content
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Provider selection (_select_provider) tests
+# ---------------------------------------------------------------------------
+
+
+def test_select_provider_academic_always_exa() -> None:
+    """academic source_type always routes to exa regardless of mode or tavily presence."""
+    assert _select_provider("academic", "fast", has_tavily=True) == "exa"
+
+
+def test_select_provider_web_fast_with_tavily_uses_tavily() -> None:
+    """web + fast mode + tavily available → tavily."""
+    assert _select_provider("web", "fast", has_tavily=True) == "tavily"
+
+
+def test_select_provider_news_fast_with_tavily_uses_tavily() -> None:
+    """news + fast mode + tavily available → tavily."""
+    assert _select_provider("news", "fast", has_tavily=True) == "tavily"
+
+
+def test_select_provider_web_research_mode_uses_exa() -> None:
+    """web + research mode → exa even when tavily is available."""
+    assert _select_provider("web", "research", has_tavily=True) == "exa"
+
+
+def test_select_provider_web_fast_without_tavily_uses_exa() -> None:
+    """web + fast mode + no tavily → falls back to exa."""
+    assert _select_provider("web", "fast", has_tavily=False) == "exa"
+
+
+def test_select_provider_news_research_without_tavily_uses_exa() -> None:
+    """news + research mode + no tavily → exa."""
+    assert _select_provider("news", "research", has_tavily=False) == "exa"
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: _TavilyResult duck-type and _search_tavily mapping tests
+# ---------------------------------------------------------------------------
+
+
+def test_tavily_result_has_expected_attributes() -> None:
+    """_TavilyResult exposes url, title, text, highlights, published_date."""
+    r = _TavilyResult(
+        url="http://example.com",
+        title="Test Title",
+        text="Test content",
+        published_date="2026-01-01",
+    )
+    assert r.url == "http://example.com"
+    assert r.title == "Test Title"
+    assert r.text == "Test content"
+    assert r.highlights == []
+    assert r.published_date == "2026-01-01"
+
+
+@pytest.mark.asyncio
+async def test_search_tavily_maps_results_correctly() -> None:
+    """_search_tavily maps Tavily API response to _TavilyResult objects."""
+    mock_client = MagicMock()
+    mock_client.search = AsyncMock(
+        return_value={
+            "results": [
+                {
+                    "url": "http://tavily.com/article",
+                    "title": "Tavily Article",
+                    "content": "Article body text",
+                    "published_date": "2026-03-15",
+                }
+            ]
+        }
+    )
+
+    results = await _search_tavily(mock_client, "test query", "web")  # type: ignore[arg-type]
+
+    assert len(results) == 1
+    result = results[0]
+    assert isinstance(result, _TavilyResult)
+    assert result.url == "http://tavily.com/article"
+    assert result.title == "Tavily Article"
+    assert result.text == "Article body text"
+    assert result.highlights == []
+    assert result.published_date == "2026-03-15"
+
+
+@pytest.mark.asyncio
+async def test_search_tavily_empty_results_returns_empty_list() -> None:
+    """_search_tavily with no results returns an empty list."""
+    mock_client = MagicMock()
+    mock_client.search = AsyncMock(return_value={"results": []})
+
+    results = await _search_tavily(mock_client, "test query", "web")  # type: ignore[arg-type]
+
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: Brave fallback tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_brave_fallback_triggers_when_primary_search_fails() -> None:
+    """When Exa raises, _search_brave is called and its results are used."""
+    import httpx
+
+    runtime = MagicMock()
+    runtime.context = MagicMock(spec=NofrinContext)
+    runtime.context.exa_client = MagicMock()
+    runtime.context.llm_worker = MagicMock()
+    runtime.context.tavily_client = None
+    runtime.context.brave_api_key = "test-brave-key"
+
+    brave_result = _TavilyResult(
+        url="http://brave.com/result",
+        title="Brave Result",
+        text="Brave content",
+        published_date=None,
+    )
+
+    exa_error = httpx.HTTPStatusError(
+        "429 Too Many Requests",
+        request=MagicMock(),
+        response=MagicMock(),
+    )
+
+    with patch("agents.worker._search_exa", side_effect=exa_error):
+        with patch(
+            "agents.worker._search_brave", AsyncMock(return_value=[brave_result])
+        ):
+            with patch(
+                "agents.worker._extract_all_evidence",
+                AsyncMock(return_value=([], 0)),
+            ):
+                result = await worker_node(
+                    make_worker_state("web", "research"), runtime
+                )
+
+    # Brave fallback ran; worker returned a valid WorkerResult
+    assert len(result["worker_results"]) == 1
+    assert result["worker_results"][0].worker_id == "worker-123"
+
+
+@pytest.mark.asyncio
+async def test_brave_fallback_also_fails_returns_empty_evidence() -> None:
+    """When both primary search and Brave fail, worker returns empty evidence."""
+    import httpx
+
+    runtime = MagicMock()
+    runtime.context = MagicMock(spec=NofrinContext)
+    runtime.context.exa_client = MagicMock()
+    runtime.context.llm_worker = MagicMock()
+    runtime.context.tavily_client = None
+    runtime.context.brave_api_key = "test-brave-key"
+
+    exa_error = httpx.HTTPStatusError(
+        "503 Service Unavailable",
+        request=MagicMock(),
+        response=MagicMock(),
+    )
+
+    with patch("agents.worker._search_exa", side_effect=exa_error):
+        with patch(
+            "agents.worker._search_brave",
+            side_effect=RuntimeError("Brave also down"),
+        ):
+            with patch(
+                "agents.worker._extract_all_evidence",
+                AsyncMock(return_value=([], 0)),
+            ):
+                result = await worker_node(
+                    make_worker_state("web", "research"), runtime
+                )
+
+    worker_result = result["worker_results"][0]
+    assert worker_result.evidence_items == []
+    assert worker_result.tokens_used == 0

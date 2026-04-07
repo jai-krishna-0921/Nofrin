@@ -27,6 +27,7 @@ def build_state(
         user_query="test query",
         intent_type="factual",
         output_format="markdown",
+        research_mode="research",
         sub_queries=sub_queries,
         source_routing=source_routing,
         worker_results=[],

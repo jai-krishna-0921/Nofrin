@@ -1,323 +1,322 @@
-# Plan: agents/delivery.py
-
-> **Context:** coordinator + grounding_check + critic done (142/142 tests). Next: delivery (final node before END).
+# Deep Research Agent v2 Enhancements — Implementation Plan
 
 ## Problem Statement
 
-The delivery node is the terminal formatting node in the Deep Research Agent pipeline. It transforms the structured `SynthesisOutput` (and optional `CriticOutput`) into a human-readable document in the requested output format. Unlike other agent nodes, delivery performs **pure formatting logic with zero LLM calls**. It must detect the force-delivery case (`revision_count >= 2`, `critic_output.passed == False`) and inject a quality caveat at the top of the output. The node reads `output_format` from state and dispatches to the appropriate renderer (markdown only for now; docx/pdf/pptx are TODO stubs that raise `NotImplementedError`).
+The current pipeline operates in a single mode optimized for comprehensive research: 5 sub-queries, full Exa content retrieval, and up to 2 revision passes. This makes every query expensive (~$0.15–0.45) and slow (30–90s). Users need:
+
+1. A **fast mode** for quick lookups that trades depth for speed and cost.
+2. **Multi-provider search routing** to improve resilience (Tavily for fast/web, Exa for academic, Brave fallback).
+3. **Per-node latency instrumentation** so bottlenecks are visible at pipeline end.
 
 ---
 
-## Answers to Planning Questions
+## Feature 1 — Dual Mode (`--mode fast|research`)
 
-### Q1: What does delivery read from state?
+### Approach
 
-| Field | Read | Why |
-|---|---|---|
-| `synthesis` | ✅ | Primary content: topic, executive_summary, findings, risks, gaps, citations |
-| `critic_output` | ✅ | Quality badge: `critic_output.passed` and `final_quality_score` |
-| `output_format` | ✅ | Dispatches to correct renderer |
-| `revision_count` | ✅ | Detects force-delivery case |
-| `cost_usd` | ❌ | Not user-facing |
-| `final_output` | ❌ | This is what we WRITE, not read |
-| `grounding_issues` | ❌ | Already incorporated into critic scoring |
+Add a `ResearchMode` literal to state and a `--mode` CLI flag. Nodes that behave differently read `state["research_mode"]` directly — no changes to `NofrinContext`.
 
-### Q2: What format(s) does it produce?
+**Why state, not context?** Context holds injected dependencies (LLM clients, API clients). Mode is an execution parameter — it belongs in state alongside `revision_count` and `output_format`.
 
-- `markdown`: Fully implemented via `render_markdown()` pure function.
-- `docx`, `pdf`, `pptx`: Raise `NotImplementedError("Format not yet implemented")` stubs.
+### Files to Modify
 
-**Why markdown only:** Other formats require external dependencies (python-docx, WeasyPrint, python-pptx) not yet integrated. Markdown is the dev-default format and serves as the reference renderer.
+| File | Change |
+|------|--------|
+| `graph/state.py` | Add `ResearchMode = Literal["fast", "research"]`; add `research_mode: ResearchMode` field |
+| `main.py` | Add `--mode` argparse arg, pass to initial state |
+| `agents/supervisor.py` | Limit sub-queries to 3 in fast mode |
+| `graph/router.py` | Skip revision loop in fast mode (`route_after_critic` returns `"delivery"` immediately) |
 
-### Q3: State write
+> `agents/worker.py` changes are in Feature 2.
 
-Returns `{"final_output": str}` — LangGraph merges this partial update into state.
+### Code Snippets
 
-### Q4: Force-delivery case
-
-**Detection:**
+**`graph/state.py`** — add after existing `Literal` imports:
 ```python
-is_force_delivered = (
-    state["revision_count"] >= _MAX_REVISIONS
-    and state["critic_output"] is not None
-    and not state["critic_output"].passed
+ResearchMode = Literal["fast", "research"]
+```
+Add field to `ResearchAgentState` (after `output_format`):
+```python
+research_mode: ResearchMode  # "fast" or "research"
+```
+
+**`main.py`** — add after `--format` arg:
+```python
+parser.add_argument(
+    "--mode",
+    dest="research_mode",
+    choices=["fast", "research"],
+    default="fast",
+    help="'fast' (3 queries, no revision) or 'research' (5 queries, 2 revisions). Default: fast.",
 )
 ```
-
-**Caveat text (exact):**
-```
-> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.
-```
-
-Injected at the very top of the markdown output, before the title.
-
-### Q5: LLM call?
-
-**None.** Zero LLM calls, zero token cost. No prompt file needed. No runtime context needed.
-
-### Q6: Graph wiring change in builder.py
-
+Pass to initial state:
 ```python
-# Add import:
-from agents.delivery import delivery_node
-
-# Add node:
-builder.add_node("delivery", delivery_node)
-
-# Update conditional edges (replace END stub):
-builder.add_conditional_edges(
-    "budget_gate",
-    route_after_critic,
-    {"delivery": "delivery", "coordinator": "coordinator"},
-)
-
-# Add terminal edge:
-builder.add_edge("delivery", END)
+initial_state: ResearchAgentState = {
+    ...existing fields...,
+    "research_mode": args.research_mode,
+}
 ```
 
-Remove: the `{"delivery": END, ...}` stub in the current conditional edges map.
+**`graph/router.py`** — inside `route_after_critic`, before all other checks:
+```python
+# Fast mode: skip revision loop entirely
+if state.get("research_mode", "fast") == "fast":
+    return "delivery"
+```
 
-### Q7: Estimated token cost
+**`agents/supervisor.py`** — update `_validate_output` to accept mode and enforce sub-query count:
+```python
+def _validate_output(output: SupervisorOutput, research_mode: str = "research") -> None:
+    count = len(output.sub_queries)
+    if research_mode == "fast":
+        if count != 3:
+            raise AgentParseError(f"Fast mode requires exactly 3 sub-queries; got {count}.")
+    else:
+        if count < 3 or count > 5:
+            raise AgentParseError(f"Supervisor returned {count} sub-queries; expected 3–5.")
+```
+Read `state["research_mode"]` in `supervisor_node` and pass to `_validate_output`.
 
-**$0.00** — pure formatting.
+### Tests to Add
 
-### Q8: Tests
+| File | Count | What |
+|------|-------|------|
+| `tests/test_state.py` | +2 | `ResearchMode` type alias present; `research_mode` field in state |
+| `tests/test_supervisor.py` | +4 | Fast mode enforces 3 queries; research mode allows 3–5 |
+| `tests/test_router.py` (new) | +3 | Fast mode routes directly to delivery regardless of score |
+| `tests/test_main.py` (new) | +2 | CLI parses `--mode fast` and `--mode research` |
 
-24 test cases — see table below.
+**Feature 1 total: ~11 new tests**
+
+### Failure Modes
+
+| Failure | Mitigation |
+|---------|------------|
+| LLM ignores 3-query limit in fast mode | `_validate_output` raises `AgentParseError` → retry |
+| `research_mode` absent from old state | `.get("research_mode", "fast")` safe default |
+| Invalid `--mode` value | `argparse choices=` rejects at CLI level |
+
+### Token Cost Impact
+
+| Mode | Sub-queries | Revision passes | Approx. cost |
+|------|-------------|-----------------|--------------|
+| `research` | 5 | 0–2 | $0.15–0.45 |
+| `fast` | 3 | 0 | $0.06–0.09 |
+
+**Fast mode is ~60–70% cheaper.**
 
 ---
 
-## Files to Create / Modify
+## Feature 2 — Multi-Provider Worker Routing
 
-| Path | Action |
-|---|---|
-| `agents/delivery.py` | **Create** |
-| `agents/__init__.py` | **Update** — export `delivery_node` |
-| `graph/builder.py` | **Update** — wire delivery node, update conditional edges |
-| `tests/test_delivery.py` | **Create** — 24 tests |
+### Approach
 
----
+Add `tavily_client` (optional) and `brave_api_key` (optional) to `NofrinContext`. Worker selects provider based on `research_mode` and `source_type`:
 
-## Function Signatures (no implementation bodies)
+| Mode | source_type | Primary | Fallback |
+|------|-------------|---------|----------|
+| `fast` | `web` | Tavily (basic) | Brave |
+| `fast` | `news` | Tavily (basic) | Brave |
+| `fast` | `academic` | Exa | Brave |
+| `research` | all | Exa | Brave |
 
+Brave is always fallback-only; it triggers only when the primary call fails.
+
+### Files to Modify
+
+| File | Change |
+|------|--------|
+| `graph/context.py` | Add `tavily_client: AsyncTavilyClient | None = None` and `brave_api_key: str | None = None` |
+| `agents/worker.py` | Add provider selection, `_search_tavily()`, `_search_brave()`, unified result mapping |
+| `main.py` | Initialise Tavily client and read `BRAVE_API_KEY` from env |
+
+### Code Snippets
+
+**`graph/context.py`**:
 ```python
-"""
-agents/delivery.py
+from tavily import AsyncTavilyClient  # already in requirements or add it
 
-Delivery node: format SynthesisOutput into the requested output format.
+@dataclass
+class NofrinContext:
+    # ...existing fields...
+    tavily_client: AsyncTavilyClient | None = None
+    brave_api_key: str | None = None
+```
 
-Reads:  state["synthesis"], state["critic_output"], state["output_format"],
-        state["revision_count"]
-Writes: state["final_output"]
-
-Pure formatting logic — no LLM calls, no token cost.
-No prompt file needed.
-"""
-
-_QUALITY_CAVEAT_TEMPLATE: str = (
-    "> **QUALITY NOTICE:** This research brief was delivered after reaching "
-    "the maximum revision limit (2 revisions) without meeting the quality "
-    "threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.\n"
-)
-
-_MAX_REVISIONS: int = 2  # must match graph/router.py._MAX_REVISIONS
-
-
-def _is_force_delivered(state: ResearchAgentState) -> bool:
-    """Return True if revision_count >= 2 AND critic_output.passed == False."""
-    ...
-
-
-def _build_citation_map(citations: list[Evidence]) -> dict[str, int]:
-    """Build URL → 1-based footnote index mapping from synthesis.citations."""
-    ...
-
-
-def _render_finding(finding: Finding, citation_map: dict[str, int]) -> str:
-    """Render a single finding as markdown (### heading, body, [^N] refs)."""
-    ...
-
-
-def _render_citations_section(citations: list[Evidence]) -> str:
-    """Render the References section with footnote definitions.
-
-    Format: [^1]: [Source Title](URL) - Published: YYYY-MM-DD
-    Returns empty string if citations is empty.
-    """
-    ...
-
-
-def _render_quality_badge(
-    critic_output: CriticOutput | None,
-    is_force_delivered: bool,
+**`agents/worker.py`** — provider selection helper:
+```python
+def _select_provider(
+    source_type: SourceType,
+    research_mode: str,
+    has_tavily: bool,
 ) -> str:
-    """Render the quality badge line.
-
-    Outputs:
-      "**Quality: PASS** (4.25/5.0)"    — when critic_output.passed
-      "**Quality: REVIEW RECOMMENDED** (3.50/5.0)"  — when force-delivered
-      "**Quality: N/A**"                 — when critic_output is None
-    """
-    ...
-
-
-def render_markdown(
-    synthesis: SynthesisOutput,
-    critic_output: CriticOutput | None,
-    is_force_delivered: bool,
-) -> str:
-    """Render SynthesisOutput as a complete markdown document.
-
-    Pure function: no side effects, no LLM calls, deterministic output.
-
-    Section order:
-        1. Quality caveat (ONLY if force-delivered)
-        2. # {topic}
-        3. Quality badge line
-        4. ## Executive Summary
-        5. ## Key Findings (### per finding, [^N] footnote refs)
-        6. ## Risks  (omit if empty)
-        7. ## Known Gaps  (omit if empty)
-        8. ## References (footnote definitions, omit if no citations)
-    """
-    ...
-
-
-async def delivery_node(
-    state: ResearchAgentState,
-) -> dict[str, str]:
-    """LangGraph node: format synthesis into the requested output format.
-
-    Note: no Runtime parameter — no LLM client needed.
-
-    Raises:
-        ValueError: If synthesis is None.
-        NotImplementedError: If output_format is "docx", "pdf", or "pptx".
-    """
-    ...
+    if source_type == "academic":
+        return "exa"
+    if research_mode == "fast" and has_tavily:
+        return "tavily"
+    return "exa"
 ```
+
+**`agents/worker.py`** — Tavily search:
+```python
+async def _search_tavily(
+    client: AsyncTavilyClient,
+    query: str,
+    source_type: SourceType,
+) -> list[ExaResult]:
+    resp = await client.search(
+        query,
+        search_depth="basic",
+        max_results=5,
+        include_raw_content=True,
+    )
+    return [
+        ExaResult(url=r["url"], title=r.get("title", ""), text=r.get("content", ""), highlights=[], published_date=r.get("published_date"))
+        for r in resp.get("results", [])
+    ]
+```
+(Reuse existing `ExaResult` dataclass for uniformity; avoids a new type just for this.)
+
+**Brave fallback** — only triggered via `return_exceptions=True` path already in place:
+```python
+async def _search_brave(api_key: str, query: str) -> list[ExaResult]:
+    async with httpx.AsyncClient() as client:
+        r = await client.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"X-Subscription-Token": api_key},
+            params={"q": query, "count": 5},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return [
+            ExaResult(url=h["url"], title=h.get("title", ""), text=h.get("description", ""), highlights=[], published_date=None)
+            for h in r.json().get("web", {}).get("results", [])
+        ]
+```
+
+### Tests to Add
+
+| File | Count | What |
+|------|-------|------|
+| `tests/test_worker.py` | +6 | `_select_provider` for all mode × source_type combos |
+| `tests/test_worker.py` | +3 | Tavily result mapped to `ExaResult` shape |
+| `tests/test_worker.py` | +2 | Brave fallback triggers when primary raises |
+| `tests/test_context.py` (new) | +2 | Optional client fields default to `None` |
+
+**Feature 2 total: ~13 new tests**
+
+### Failure Modes
+
+| Failure | Mitigation |
+|---------|------------|
+| `TAVILY_API_KEY` missing | `tavily_client=None` → fall through to Exa |
+| `BRAVE_API_KEY` missing | Brave fallback skipped; worker returns empty evidence |
+| Tavily rate limit / 429 | Exception caught by `return_exceptions=True`; worker returns `[]` |
+
+### Token / Cost Impact
+
+No LLM token impact. Search costs:
+- Tavily basic: ~$0.001/query, 0.5–1 s latency
+- Exa: ~$0.001/query, 1–3 s latency
+- Brave: ~$0.003/query, 0.5–1 s latency
 
 ---
 
-## render_markdown() Output Specification
+## Feature 3 — Latency Instrumentation (Pipeline Summary)
 
-### Section order (exact)
+### Approach
 
-```
-1. [Quality caveat — only if force-delivered]
-2. # {topic}
-3. {quality_badge}
-4. ## Executive Summary
-   {executive_summary}
-5. ## Key Findings
-   ### {finding.heading}
-   {finding.body}[^i][^j]
-6. ## Risks         [omit if empty]
-   - {risk}
-7. ## Known Gaps    [omit if empty]
-   - {gap}
-8. ## References    [omit if no citations]
-   [^1]: [Title](URL) - Published: date
-```
+Extend `graph/progress.py` with a `pipeline_summary()` function. Called from `main.py` after `pipeline_done()`. Reads `_STEP_TIMERS` (already populated by every node's `*_start()` call) and prints a table. Flags nodes exceeding 10 s as `[SLOW]`.
 
-### Example (force-delivered, score 3.50)
+### Files to Modify
 
-```markdown
-> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: 3.50/5.0). Review with appropriate scrutiny.
+| File | Change |
+|------|--------|
+| `graph/progress.py` | Add `_SLOW_THRESHOLD_SECS`, `_NODE_ELAPSED` dict (records when each `*_done` call happens), and `pipeline_summary()` |
+| `main.py` | Call `pipeline_summary()` after `pipeline_done()` |
 
-# Renewable Energy Investment Trends 2025
+### Code Snippet
 
-**Quality: REVIEW RECOMMENDED** (3.50/5.0)
+**`graph/progress.py`** additions:
 
-## Executive Summary
+```python
+_SLOW_THRESHOLD_SECS: float = 10.0
+_NODE_END_TIMES: dict[str, float] = {}  # populated by each *_done function
 
-Global renewable energy investments reached $500 billion in 2024...
 
-## Key Findings
+def _step_end(name: str) -> None:
+    """Record the wall-clock time when a step finishes."""
+    _NODE_END_TIMES[name] = time.monotonic()
 
-### Solar Costs Continue to Decline
 
-The levelized cost of solar energy dropped 12% year-over-year.[^1][^2]
-
-## Risks
-
-- Supply chain constraints may slow deployment in 2025
-
-## Known Gaps
-
-- Limited data on emerging markets
-
-## References
-
-[^1]: [IEA World Energy Outlook 2024](https://iea.org/reports/weo-2024) - Published: 2024-10-15
-[^2]: [BloombergNEF Solar Report](https://about.bnef.com/solar) - Published: 2024-09-20
+def pipeline_summary() -> None:
+    """Print per-node elapsed time table. Flag nodes >10 s as [SLOW]."""
+    _emit(_CYAN, "PIPELINE SUMMARY", "per-node latency")
+    total = time.monotonic() - _START_TIME
+    nodes = [
+        "supervisor", "coordinator", "grounding", "critic", "delivery",
+    ]
+    for node in nodes:
+        start = _STEP_TIMERS.get(node)
+        end = _NODE_END_TIMES.get(node)
+        if start is None or end is None:
+            continue
+        elapsed = end - start
+        pct = (elapsed / total * 100) if total > 0 else 0.0
+        slow = f" {_RED}[SLOW]{_RESET}" if elapsed > _SLOW_THRESHOLD_SECS else ""
+        print(
+            f"  {_DIM}{node:<20}{_RESET}  {elapsed:6.1f}s  ({pct:4.1f}%){slow}",
+            file=sys.stderr,
+        )
+    print(
+        f"  {_DIM}{'TOTAL':<20}{_RESET}  {total:6.1f}s",
+        file=sys.stderr,
+    )
 ```
 
-### Example (passed, score 4.25)
+Wire `_step_end("coordinator")` into `coordinator_done()`, etc. (one line per existing `*_done` function).
 
-```markdown
-# Renewable Energy Investment Trends 2025
+### Tests to Add
 
-**Quality: PASS** (4.25/5.0)
+| File | Count | What |
+|------|-------|------|
+| `tests/test_progress.py` (new) | +3 | Summary prints all nodes; flags slow node; skips missing nodes |
+| `tests/test_progress.py` | +2 | `_step_end` records time; `_step_elapsed` calculation |
+| `tests/test_progress.py` | +1 | Zero-division guard when total=0 |
 
-## Executive Summary
-...
-```
+**Feature 3 total: ~6 new tests**
+
+### Failure Modes
+
+| Failure | Mitigation |
+|---------|------------|
+| Node never ran (e.g., revision skipped) | `if start is None or end is None: continue` |
+| `total_elapsed == 0` | `if total > 0` guard |
+
+### Token / Cost Impact
+
+**Zero.** Pure logging.
 
 ---
 
-## Test Cases (24)
+## Dependency Order & Recommended Sequence
 
-| # | Test | Assertion |
-|---|---|---|
-| 1 | `test_delivery_node_returns_final_output_key` | `"final_output" in result` |
-| 2 | `test_final_output_is_string` | `isinstance(result["final_output"], str)` |
-| 3 | `test_markdown_contains_topic_as_title` | `"# Test Topic"` in output |
-| 4 | `test_markdown_contains_executive_summary_heading` | `"## Executive Summary"` in output |
-| 5 | `test_markdown_contains_all_finding_headings` | All finding headings as `###` in output |
-| 6 | `test_findings_have_footnote_refs` | `[^1]` appears in finding body |
-| 7 | `test_risks_section_present_when_nonempty` | `"## Risks"` in output |
-| 8 | `test_gaps_section_present_when_nonempty` | `"## Known Gaps"` in output |
-| 9 | `test_citations_section_present` | `"## References"` and `[^1]:` in output |
-| 10 | `test_quality_badge_pass` | `"Quality: PASS"` in output when `critic_output.passed=True` |
-| 11 | `test_quality_badge_review_recommended` | `"Quality: REVIEW RECOMMENDED"` when force-delivered |
-| 12 | `test_force_delivery_caveat_injected_at_top` | `"QUALITY NOTICE:"` is first non-empty line |
-| 13 | `test_force_delivery_caveat_contains_score` | `"3.50/5.0"` in caveat string |
-| 14 | `test_no_caveat_when_critic_passed` | `"QUALITY NOTICE"` not in output |
-| 15 | `test_no_caveat_when_revision_under_cap` | `revision_count=1, passed=False` → no caveat |
-| 16 | `test_synthesis_none_raises_value_error` | `ValueError` before any rendering |
-| 17 | `test_output_format_markdown_produces_output` | `len(result["final_output"]) > 0` |
-| 18 | `test_output_format_docx_raises_not_implemented` | `NotImplementedError` |
-| 19 | `test_output_format_pdf_raises_not_implemented` | `NotImplementedError` |
-| 20 | `test_output_format_pptx_raises_not_implemented` | `NotImplementedError` |
-| 21 | `test_render_markdown_is_pure` | Same args → identical output on two calls |
-| 22 | `test_citations_format_url_and_title` | `[Title](URL)` pattern in References |
-| 23 | `test_empty_risks_omits_section` | `"## Risks"` NOT in output when `risks=[]` |
-| 24 | `test_empty_gaps_omits_section` | `"## Known Gaps"` NOT in output when `gaps=[]` |
+```
+Feature 1 (Dual Mode)           ← must land first (Feature 2 reads research_mode)
+    └── Feature 2 (Multi-Provider)
+Feature 3 (Latency)             ← independent, can land any time
+```
+
+Recommended: implement 1 → 3 → 2 (latency is a quick standalone win).
 
 ---
 
-## Failure Modes
+## Summary
 
-| Failure | Cause | Mitigation |
-|---|---|---|
-| `synthesis is None` | delivery called before coordinator | `ValueError` |
-| `critic_output is None` | edge case — critic skipped | Badge shows `N/A` |
-| Unsupported `output_format` | docx/pdf/pptx request | `NotImplementedError` |
-| Empty `findings` | coordinator edge case | `## Key Findings` section renders empty |
-| URL not in `citation_map` | evidence_ref not in citations | Append URL inline without footnote |
-| `revision_count > _MAX_REVISIONS` | router bug | `>= 2` check still fires correctly |
-
----
-
-## Architect Notes
-
-1. **No `runtime` parameter** — same pattern as `boundary_compressor_node`. Signature is `async def delivery_node(state: ResearchAgentState) -> dict[str, str]`.
-
-2. **`_MAX_REVISIONS = 2`** — must be kept in sync with `graph/router.py._MAX_REVISIONS`. Do not import from router (circular import risk); declare as a local constant.
-
-3. **`render_markdown` exported** — for direct testing and future reuse by docx/pptx renderers as a reference.
-
-4. **Section blank lines** — separate each section with a double newline (`\n\n`) for valid markdown rendering.
-
-5. **Footnote refs in findings** — only include `[^N]` for URLs present in `citation_map`; silently skip unknown refs.
+| Feature | Files changed | New tests | Cost impact |
+|---------|---------------|-----------|-------------|
+| 1 — Dual Mode | 4 | ~11 | −60% in fast mode |
+| 2 — Multi-Provider | 3 | ~13 | ~0 |
+| 3 — Latency | 2 | ~6 | 0 |
+| **Total** | **9** | **~30** | |

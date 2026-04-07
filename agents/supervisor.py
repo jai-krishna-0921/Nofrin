@@ -169,24 +169,34 @@ def _build_messages(
 # ---------------------------------------------------------------------------
 
 
-def _validate_output(output: SupervisorOutput) -> None:
+def _validate_output(output: SupervisorOutput, research_mode: str = "research") -> None:
     """Validate parsed supervisor output for structural correctness.
 
     Checks:
-    - 3 <= len(sub_queries) <= 5
+    - fast mode: exactly 3 sub-queries
+    - research mode: 3 <= len(sub_queries) <= 5
     - All source_type values are valid SourceType literals
     - No duplicate query strings
     - No empty query strings
 
     Args:
         output: The parsed SupervisorOutput to validate.
+        research_mode: "fast" or "research" — controls query count rule.
 
     Raises:
         AgentParseError: If any validation rule is violated.
     """
     count = len(output.sub_queries)
-    if count < 3 or count > 5:
-        raise AgentParseError(f"Supervisor returned {count} sub-queries; expected 3–5.")
+    if research_mode == "fast":
+        if count != 3:
+            raise AgentParseError(
+                f"Fast mode requires exactly 3 sub-queries; got {count}."
+            )
+    else:
+        if count < 3 or count > 5:
+            raise AgentParseError(
+                f"Supervisor returned {count} sub-queries; expected 3–5."
+            )
 
     queries: list[str] = []
     for sq in output.sub_queries:
@@ -221,6 +231,7 @@ def _validate_output(output: SupervisorOutput) -> None:
 async def _call_llm(
     user_query: str,
     llm: BaseChatModel,
+    research_mode: str = "research",
 ) -> SupervisorOutput:
     """Call the LLM and parse the response into a typed SupervisorOutput.
 
@@ -271,7 +282,7 @@ async def _call_llm(
         intent_type=raw_output["intent_type"],  # type: ignore[arg-type]
         sub_queries=sub_queries,
     )
-    _validate_output(output)
+    _validate_output(output, research_mode)
     return output
 
 
@@ -313,8 +324,9 @@ async def supervisor_node(
     if not user_query:
         raise ValueError("state['user_query'] must not be empty.")
 
+    research_mode: str = str(state.get("research_mode", "research"))
     supervisor_start(user_query)
-    output = await _call_llm(user_query, runtime.context.llm_supervisor)
+    output = await _call_llm(user_query, runtime.context.llm_supervisor, research_mode)
     sub_queries = [sq.query for sq in output.sub_queries]
     supervisor_done(str(output.intent_type), sub_queries)
 
