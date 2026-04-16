@@ -1,322 +1,371 @@
-# Deep Research Agent v2 Enhancements — Implementation Plan
+# Deep Research Agent — FastAPI Web UI Plan
 
 ## Problem Statement
 
-The current pipeline operates in a single mode optimized for comprehensive research: 5 sub-queries, full Exa content retrieval, and up to 2 revision passes. This makes every query expensive (~$0.15–0.45) and slow (30–90s). Users need:
-
-1. A **fast mode** for quick lookups that trades depth for speed and cost.
-2. **Multi-provider search routing** to improve resilience (Tavily for fast/web, Exa for academic, Brave fallback).
-3. **Per-node latency instrumentation** so bottlenecks are visible at pipeline end.
+The pipeline only has a CLI interface (`main.py`). Adding a web UI enables browser-based research queries with real-time progress streaming, allowing users to submit queries, observe live status updates as each pipeline node executes, and receive the final research brief rendered as HTML. Target pipeline runtime is 30–90 seconds, making real-time progress feedback essential for UX.
 
 ---
 
-## Feature 1 — Dual Mode (`--mode fast|research`)
+## Architecture Decision: SSE Streaming
 
-### Approach
-
-Add a `ResearchMode` literal to state and a `--mode` CLI flag. Nodes that behave differently read `state["research_mode"]` directly — no changes to `NofrinContext`.
-
-**Why state, not context?** Context holds injected dependencies (LLM clients, API clients). Mode is an execution parameter — it belongs in state alongside `revision_count` and `output_format`.
-
-### Files to Modify
-
-| File | Change |
-|------|--------|
-| `graph/state.py` | Add `ResearchMode = Literal["fast", "research"]`; add `research_mode: ResearchMode` field |
-| `main.py` | Add `--mode` argparse arg, pass to initial state |
-| `agents/supervisor.py` | Limit sub-queries to 3 in fast mode |
-| `graph/router.py` | Skip revision loop in fast mode (`route_after_critic` returns `"delivery"` immediately) |
-
-> `agents/worker.py` changes are in Feature 2.
-
-### Code Snippets
-
-**`graph/state.py`** — add after existing `Literal` imports:
-```python
-ResearchMode = Literal["fast", "research"]
-```
-Add field to `ResearchAgentState` (after `output_format`):
-```python
-research_mode: ResearchMode  # "fast" or "research"
-```
-
-**`main.py`** — add after `--format` arg:
-```python
-parser.add_argument(
-    "--mode",
-    dest="research_mode",
-    choices=["fast", "research"],
-    default="fast",
-    help="'fast' (3 queries, no revision) or 'research' (5 queries, 2 revisions). Default: fast.",
-)
-```
-Pass to initial state:
-```python
-initial_state: ResearchAgentState = {
-    ...existing fields...,
-    "research_mode": args.research_mode,
-}
-```
-
-**`graph/router.py`** — inside `route_after_critic`, before all other checks:
-```python
-# Fast mode: skip revision loop entirely
-if state.get("research_mode", "fast") == "fast":
-    return "delivery"
-```
-
-**`agents/supervisor.py`** — update `_validate_output` to accept mode and enforce sub-query count:
-```python
-def _validate_output(output: SupervisorOutput, research_mode: str = "research") -> None:
-    count = len(output.sub_queries)
-    if research_mode == "fast":
-        if count != 3:
-            raise AgentParseError(f"Fast mode requires exactly 3 sub-queries; got {count}.")
-    else:
-        if count < 3 or count > 5:
-            raise AgentParseError(f"Supervisor returned {count} sub-queries; expected 3–5.")
-```
-Read `state["research_mode"]` in `supervisor_node` and pass to `_validate_output`.
-
-### Tests to Add
-
-| File | Count | What |
-|------|-------|------|
-| `tests/test_state.py` | +2 | `ResearchMode` type alias present; `research_mode` field in state |
-| `tests/test_supervisor.py` | +4 | Fast mode enforces 3 queries; research mode allows 3–5 |
-| `tests/test_router.py` (new) | +3 | Fast mode routes directly to delivery regardless of score |
-| `tests/test_main.py` (new) | +2 | CLI parses `--mode fast` and `--mode research` |
-
-**Feature 1 total: ~11 new tests**
-
-### Failure Modes
-
-| Failure | Mitigation |
-|---------|------------|
-| LLM ignores 3-query limit in fast mode | `_validate_output` raises `AgentParseError` → retry |
-| `research_mode` absent from old state | `.get("research_mode", "fast")` safe default |
-| Invalid `--mode` value | `argparse choices=` rejects at CLI level |
-
-### Token Cost Impact
-
-| Mode | Sub-queries | Revision passes | Approx. cost |
-|------|-------------|-----------------|--------------|
-| `research` | 5 | 0–2 | $0.15–0.45 |
-| `fast` | 3 | 0 | $0.06–0.09 |
-
-**Fast mode is ~60–70% cheaper.**
+**SSE over WebSockets and polling.** The pipeline is fire-and-observe: the client submits a query via POST then receives a unidirectional event stream, which exactly matches SSE semantics. Unlike WebSockets, SSE requires no bidirectional communication, uses standard HTTP, works through proxies without special configuration, and auto-reconnects natively in browsers. Polling would require clients to hit a status endpoint every 1–2 seconds for 30–90 seconds — wasteful and slow to surface progress. SSE delivers events instantly as they occur. `sse-starlette` provides a production-ready implementation that integrates cleanly with FastAPI's async architecture and the project's all-async requirement (CLAUDE.md).
 
 ---
 
-## Feature 2 — Multi-Provider Worker Routing
+## File Structure
 
-### Approach
+```
+api/
+  __init__.py          # Package marker
+  server.py            # FastAPI app + endpoints
+  session_store.py     # In-memory SessionState dict
+  pipeline.py          # run_pipeline() coroutine
+static/
+  index.html           # Single-file frontend (no npm, no build step)
+tests/
+  test_api.py          # 15 new tests (added to existing tests/ dir)
+```
 
-Add `tavily_client` (optional) and `brave_api_key` (optional) to `NofrinContext`. Worker selects provider based on `research_mode` and `source_type`:
+---
 
-| Mode | source_type | Primary | Fallback |
-|------|-------------|---------|----------|
-| `fast` | `web` | Tavily (basic) | Brave |
-| `fast` | `news` | Tavily (basic) | Brave |
-| `fast` | `academic` | Exa | Brave |
-| `research` | all | Exa | Brave |
+## Session State Design
 
-Brave is always fallback-only; it triggers only when the primary call fails.
-
-### Files to Modify
-
-| File | Change |
-|------|--------|
-| `graph/context.py` | Add `tavily_client: AsyncTavilyClient | None = None` and `brave_api_key: str | None = None` |
-| `agents/worker.py` | Add provider selection, `_search_tavily()`, `_search_brave()`, unified result mapping |
-| `main.py` | Initialise Tavily client and read `BRAVE_API_KEY` from env |
-
-### Code Snippets
-
-**`graph/context.py`**:
 ```python
-from tavily import AsyncTavilyClient  # already in requirements or add it
+# api/session_store.py
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Literal
+
+SessionStatus = Literal["pending", "running", "done", "error"]
+
 
 @dataclass
-class NofrinContext:
-    # ...existing fields...
-    tavily_client: AsyncTavilyClient | None = None
-    brave_api_key: str | None = None
+class SessionState:
+    """State for a single research session.
+
+    Attributes:
+        session_id:   Unique identifier for this session.
+        status:       Current lifecycle status.
+        events:       Buffered SSE payloads for late-joining clients.
+        final_output: Rendered markdown output when done.
+        cost_usd:     Total LLM cost for this session.
+        tokens_used:  Total tokens consumed.
+        error:        Error message if status == "error".
+        created_at:   Session creation timestamp (UTC).
+    """
+
+    session_id: str
+    status: SessionStatus = "pending"
+    events: list[str] = field(default_factory=list)
+    final_output: str | None = None
+    cost_usd: float = 0.0
+    tokens_used: int = 0
+    error: str | None = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+class SessionStore:
+    """Thread-safe in-memory session storage with TTL cleanup."""
+
+    TTL_SECONDS: int = 3600  # 1 hour
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, SessionState] = {}
+        self._lock: threading.Lock = threading.Lock()
+
+    def create(self, session_id: str) -> SessionState:
+        session = SessionState(session_id=session_id)
+        with self._lock:
+            self._sessions[session_id] = session
+        return session
+
+    def get(self, session_id: str) -> SessionState | None:
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def set(self, session: SessionState) -> None:
+        with self._lock:
+            self._sessions[session.session_id] = session
+
+    def list_expired(self, max_age_seconds: int | None = None) -> list[str]:
+        max_age = max_age_seconds if max_age_seconds is not None else self.TTL_SECONDS
+        cutoff = datetime.utcnow() - timedelta(seconds=max_age)
+        with self._lock:
+            return [sid for sid, s in self._sessions.items() if s.created_at < cutoff]
+
+    def cleanup_expired(self, max_age_seconds: int | None = None) -> int:
+        expired = self.list_expired(max_age_seconds)
+        with self._lock:
+            for sid in expired:
+                self._sessions.pop(sid, None)
+        return len(expired)
+
+
+store = SessionStore()  # module-level singleton
 ```
 
-**`agents/worker.py`** — provider selection helper:
-```python
-def _select_provider(
-    source_type: SourceType,
-    research_mode: str,
-    has_tavily: bool,
-) -> str:
-    if source_type == "academic":
-        return "exa"
-    if research_mode == "fast" and has_tavily:
-        return "tavily"
-    return "exa"
+---
+
+## API Endpoints
+
+| Method | Path | Request Body | Response | Purpose |
+|--------|------|--------------|----------|---------|
+| `POST` | `/research` | `{"query": str, "mode": "fast"\|"research", "format": "markdown"}` | `{"session_id": str}` | Start pipeline in background task |
+| `GET` | `/stream/{session_id}` | — | SSE event stream | Real-time pipeline events |
+| `GET` | `/status/{session_id}` | — | `{"session_id", "status", "cost_usd", "tokens_used", "error"}` | Poll-friendly JSON snapshot |
+| `GET` | `/` | — | `text/html` | Serve `static/index.html` |
+
+---
+
+## SSE Event Protocol
+
+Four event types, emitted in order:
+
+### 1. `event: status`
+One per pipeline phase, sent when a node starts or completes.
+```
+event: status
+data: {"phase": "supervisor", "message": "Classifying intent and decomposing query..."}
+```
+Phases: `supervisor`, `worker`, `coordinator`, `grounding_check`, `critic`, `delivery`
+
+### 2. `event: result`
+Emitted once on successful completion.
+```
+event: result
+data: {"final_output": "# Research Brief\n\n...", "cost_usd": 0.05, "tokens": 1200}
 ```
 
-**`agents/worker.py`** — Tavily search:
+### 3. `event: error`
+Emitted on pipeline failure.
+```
+event: error
+data: {"message": "Cost ceiling exceeded: $1.02 > $1.00"}
+```
+
+### 4. `event: done`
+Always the final event — signals stream closure.
+```
+event: done
+data: 
+```
+
+---
+
+## Graph Integration
+
+`api/pipeline.py` reuses `_build_context()` and `_build_initial_state()` from `main.py` and calls `build_graph()` unchanged. An `emit` callback is injected so `graph/progress.py` can push SSE events without knowing about FastAPI.
+
+### `run_pipeline()` Signature
+
 ```python
-async def _search_tavily(
-    client: AsyncTavilyClient,
+# api/pipeline.py
+async def run_pipeline(
+    session_id: str,
     query: str,
-    source_type: SourceType,
-) -> list[ExaResult]:
-    resp = await client.search(
-        query,
-        search_depth="basic",
-        max_results=5,
-        include_raw_content=True,
-    )
-    return [
-        ExaResult(url=r["url"], title=r.get("title", ""), text=r.get("content", ""), highlights=[], published_date=r.get("published_date"))
-        for r in resp.get("results", [])
-    ]
+    output_format: OutputFormat,
+    research_mode: ResearchMode,
+    emit: Callable[[str, str], None],  # emit(event_type, json_payload)
+) -> None:
+    """Execute the research pipeline and emit SSE events via the emit callback."""
 ```
-(Reuse existing `ExaResult` dataclass for uniformity; avoids a new type just for this.)
 
-**Brave fallback** — only triggered via `return_exceptions=True` path already in place:
+### Progress Event Hooking
+
+Add to `graph/progress.py`:
+
 ```python
-async def _search_brave(api_key: str, query: str) -> list[ExaResult]:
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
-            "https://api.search.brave.com/res/v1/web/search",
-            headers={"X-Subscription-Token": api_key},
-            params={"q": query, "count": 5},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return [
-            ExaResult(url=h["url"], title=h.get("title", ""), text=h.get("description", ""), highlights=[], published_date=None)
-            for h in r.json().get("web", {}).get("results", [])
-        ]
+_SSE_CALLBACK: Callable[[str, str], None] | None = None
+
+def set_sse_callback(callback: Callable[[str, str], None] | None) -> None:
+    """Register (or clear) the SSE progress callback."""
+    global _SSE_CALLBACK
+    _SSE_CALLBACK = callback
+
+def _emit_sse(phase: str, message: str) -> None:
+    """Forward a progress event to the registered SSE callback, if any."""
+    if _SSE_CALLBACK is not None:
+        import json
+        _SSE_CALLBACK("status", json.dumps({"phase": phase, "message": message}))
 ```
 
-### Tests to Add
+Each existing `*_start()` and `*_done()` function calls `_emit_sse(node, message)` alongside the existing `_emit()` call. `run_pipeline()` calls `set_sse_callback(emit)` at start and `set_sse_callback(None)` in the `finally` block.
+
+### `POST /research` Background Task
+
+```python
+@app.post("/research", response_model=ResearchResponse)
+async def start_research(
+    request: ResearchRequest,
+    background_tasks: BackgroundTasks,
+) -> ResearchResponse:
+    session_id = str(uuid.uuid4())
+    store.create(session_id)
+
+    def emit(event_type: str, data: str) -> None:
+        session = store.get(session_id)
+        if session is None:
+            return
+        session.events.append(f"{event_type}:{data}")
+        if event_type == "error":
+            session.status = "error"
+            session.error = json.loads(data).get("message") if data else None
+        elif event_type == "result":
+            parsed = json.loads(data)
+            session.final_output = parsed.get("final_output")
+            session.cost_usd = parsed.get("cost_usd", 0.0)
+            session.tokens_used = parsed.get("tokens", 0)
+        elif event_type == "done" and session.status != "error":
+            session.status = "done"
+        store.set(session)
+
+    async def run_task() -> None:
+        session = store.get(session_id)
+        if session is not None:
+            session.status = "running"
+            store.set(session)
+        await run_pipeline(
+            session_id=session_id,
+            query=request.query,
+            output_format=request.format,
+            research_mode=request.mode,
+            emit=emit,
+        )
+
+    background_tasks.add_task(run_task)
+    return ResearchResponse(session_id=session_id)
+```
+
+### SSE Endpoint
+
+```python
+@app.get("/stream/{session_id}")
+async def stream_events(session_id: str) -> EventSourceResponse:
+    session = store.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
+        # Replay buffered events for late-joining clients
+        cursor = 0
+        while True:
+            current = store.get(session_id)
+            if current is None:
+                break
+            while cursor < len(current.events):
+                event_type, data = current.events[cursor].split(":", 1)
+                yield {"event": event_type, "data": data}
+                cursor += 1
+                if event_type == "done":
+                    return
+            if current.status in ("done", "error") and cursor >= len(current.events):
+                yield {"event": "done", "data": ""}
+                return
+            await asyncio.sleep(0.1)
+
+    return EventSourceResponse(event_generator())
+```
+
+---
+
+## Frontend UX
+
+Single `static/index.html` — no npm, no build step, no CDN build tools. Uses `marked.js` via CDN for markdown rendering.
+
+**Layout:**
+1. **Form** — query textarea, fast/research radio buttons, Submit button (disabled during run)
+2. **Progress area** — live status events as a vertical timeline with timestamps and phase badges
+3. **Results area** — final output rendered HTML (hidden until `result` event received)
+4. **Stats bar** — `$cost`, token count, elapsed duration (shown on completion)
+
+**Key JS pattern:**
+```javascript
+const res = await fetch('/research', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({query, mode, format: 'markdown'})
+});
+const {session_id} = await res.json();
+
+const es = new EventSource(`/stream/${session_id}`);
+es.addEventListener('status', e => addEvent(JSON.parse(e.data)));
+es.addEventListener('result', e => renderResult(JSON.parse(e.data)));
+es.addEventListener('error', e => showError(JSON.parse(e.data)));
+es.addEventListener('done', () => { es.close(); submitBtn.disabled = false; });
+```
+
+---
+
+## New Dependencies
+
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `fastapi` | `>=0.109.0` | Web framework |
+| `uvicorn[standard]` | `>=0.27.0` | ASGI server |
+| `sse-starlette` | `>=2.0.0` | SSE via EventSourceResponse |
+| `python-multipart` | `>=0.0.6` | Form parsing (FastAPI requirement) |
+
+Add to `requirements.txt` under a new `# ── Web API ──` section.
+
+---
+
+## Tests to Add
 
 | File | Count | What |
 |------|-------|------|
-| `tests/test_worker.py` | +6 | `_select_provider` for all mode × source_type combos |
-| `tests/test_worker.py` | +3 | Tavily result mapped to `ExaResult` shape |
-| `tests/test_worker.py` | +2 | Brave fallback triggers when primary raises |
-| `tests/test_context.py` (new) | +2 | Optional client fields default to `None` |
+| `tests/test_api.py` | +3 | SessionStore: create returns pending, get returns None for missing, list_expired finds old sessions |
+| `tests/test_api.py` | +2 | POST /research: returns 200 + UUID session_id; accepts research mode |
+| `tests/test_api.py` | +1 | GET / returns 200 HTML |
+| `tests/test_api.py` | +2 | GET /status: returns session state; 404 for missing session |
+| `tests/test_api.py` | +1 | GET /stream: 404 for unknown session_id |
+| `tests/test_api.py` | +4 | SSE stream events: status → result → done order; error event sets session.status |
+| `tests/test_api.py` | +2 | run_pipeline: emits correct event sequence with mocked graph |
 
-**Feature 2 total: ~13 new tests**
+**Total: 15 new tests**
 
-### Failure Modes
+---
+
+## Failure Modes
 
 | Failure | Mitigation |
 |---------|------------|
-| `TAVILY_API_KEY` missing | `tavily_client=None` → fall through to Exa |
-| `BRAVE_API_KEY` missing | Brave fallback skipped; worker returns empty evidence |
-| Tavily rate limit / 429 | Exception caught by `return_exceptions=True`; worker returns `[]` |
-
-### Token / Cost Impact
-
-No LLM token impact. Search costs:
-- Tavily basic: ~$0.001/query, 0.5–1 s latency
-- Exa: ~$0.001/query, 1–3 s latency
-- Brave: ~$0.003/query, 0.5–1 s latency
+| Session not found | HTTP 404 on `/stream/` and `/status/` |
+| Pipeline raises exception | `run_pipeline` `try/except` emits `error` event, sets `session.status = "error"` |
+| Client disconnects mid-stream | EventSourceResponse handles disconnect gracefully; session state persists for `/status` retrieval |
+| Memory leak from old sessions | TTL cleanup (`store.cleanup_expired()`) runs on startup and every 10 min via `asyncio.create_task` |
+| Concurrent access to session state | `threading.Lock` in `SessionStore` |
+| SSE client timeout (browser ~45s default) | Client-side `EventSource` auto-reconnects; buffered `session.events` replayed so no data lost |
 
 ---
 
-## Feature 3 — Latency Instrumentation (Pipeline Summary)
+## Cost / Performance Impact
 
-### Approach
+**LLM cost:** Zero change — no new LLM calls.
 
-Extend `graph/progress.py` with a `pipeline_summary()` function. Called from `main.py` after `pipeline_done()`. Reads `_STEP_TIMERS` (already populated by every node's `*_start()` call) and prints a table. Flags nodes exceeding 10 s as `[SLOW]`.
+**Memory overhead:**
+- Each `SessionState`: ~2–5 KB (event buffer strings)
+- 1-hour TTL + 10-min cleanup → at most ~360 sessions in memory
+- Worst case: ~1.8 MB
 
-### Files to Modify
-
-| File | Change |
-|------|--------|
-| `graph/progress.py` | Add `_SLOW_THRESHOLD_SECS`, `_NODE_ELAPSED` dict (records when each `*_done` call happens), and `pipeline_summary()` |
-| `main.py` | Call `pipeline_summary()` after `pipeline_done()` |
-
-### Code Snippet
-
-**`graph/progress.py`** additions:
-
-```python
-_SLOW_THRESHOLD_SECS: float = 10.0
-_NODE_END_TIMES: dict[str, float] = {}  # populated by each *_done function
-
-
-def _step_end(name: str) -> None:
-    """Record the wall-clock time when a step finishes."""
-    _NODE_END_TIMES[name] = time.monotonic()
-
-
-def pipeline_summary() -> None:
-    """Print per-node elapsed time table. Flag nodes >10 s as [SLOW]."""
-    _emit(_CYAN, "PIPELINE SUMMARY", "per-node latency")
-    total = time.monotonic() - _START_TIME
-    nodes = [
-        "supervisor", "coordinator", "grounding", "critic", "delivery",
-    ]
-    for node in nodes:
-        start = _STEP_TIMERS.get(node)
-        end = _NODE_END_TIMES.get(node)
-        if start is None or end is None:
-            continue
-        elapsed = end - start
-        pct = (elapsed / total * 100) if total > 0 else 0.0
-        slow = f" {_RED}[SLOW]{_RESET}" if elapsed > _SLOW_THRESHOLD_SECS else ""
-        print(
-            f"  {_DIM}{node:<20}{_RESET}  {elapsed:6.1f}s  ({pct:4.1f}%){slow}",
-            file=sys.stderr,
-        )
-    print(
-        f"  {_DIM}{'TOTAL':<20}{_RESET}  {total:6.1f}s",
-        file=sys.stderr,
-    )
-```
-
-Wire `_step_end("coordinator")` into `coordinator_done()`, etc. (one line per existing `*_done` function).
-
-### Tests to Add
-
-| File | Count | What |
-|------|-------|------|
-| `tests/test_progress.py` (new) | +3 | Summary prints all nodes; flags slow node; skips missing nodes |
-| `tests/test_progress.py` | +2 | `_step_end` records time; `_step_elapsed` calculation |
-| `tests/test_progress.py` | +1 | Zero-division guard when total=0 |
-
-**Feature 3 total: ~6 new tests**
-
-### Failure Modes
-
-| Failure | Mitigation |
-|---------|------------|
-| Node never ran (e.g., revision skipped) | `if start is None or end is None: continue` |
-| `total_elapsed == 0` | `if total > 0` guard |
-
-### Token / Cost Impact
-
-**Zero.** Pure logging.
+**Latency:** SSE poll interval 100ms — negligible. No additional network round-trips vs CLI.
 
 ---
 
-## Dependency Order & Recommended Sequence
+## Run Commands
 
+```bash
+# Install new deps
+pip install -r requirements.txt
+
+# Start development server
+uvicorn api.server:app --reload --port 8000
+
+# Run all tests including new API tests
+pytest tests/ -v
+
+# Type check new API files
+mypy api/ --strict
 ```
-Feature 1 (Dual Mode)           ← must land first (Feature 2 reads research_mode)
-    └── Feature 2 (Multi-Provider)
-Feature 3 (Latency)             ← independent, can land any time
-```
-
-Recommended: implement 1 → 3 → 2 (latency is a quick standalone win).
-
----
-
-## Summary
-
-| Feature | Files changed | New tests | Cost impact |
-|---------|---------------|-----------|-------------|
-| 1 — Dual Mode | 4 | ~11 | −60% in fast mode |
-| 2 — Multi-Provider | 3 | ~13 | ~0 |
-| 3 — Latency | 2 | ~6 | 0 |
-| **Total** | **9** | **~30** | |

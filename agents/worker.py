@@ -555,7 +555,7 @@ async def worker_node(
     brave_key = runtime.context.brave_api_key
 
     provider = _select_provider(source_type, research_mode, tavily is not None)
-    worker_exa_search(worker_id, sub_query, str(source_type))
+    worker_exa_search(worker_id, sub_query, str(source_type), provider)
 
     exa_results: list[object]
     try:
