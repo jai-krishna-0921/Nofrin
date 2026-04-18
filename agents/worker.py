@@ -18,11 +18,14 @@ import asyncio
 import logging
 from datetime import date, timedelta
 from pathlib import Path
-from typing import TypedDict, cast
+from typing import TYPE_CHECKING, TypedDict, cast
 
 import httpx
 from exa_py import AsyncExa
 from langchain_core.language_models import BaseChatModel
+
+if TYPE_CHECKING:
+    from tavily import AsyncTavilyClient
 from langchain_core.messages import BaseMessage, SystemMessage
 from langgraph.runtime import Runtime
 from tenacity import (
@@ -251,6 +254,95 @@ async def _search_exa(
 
 
 # ---------------------------------------------------------------------------
+# Provider selection + alternative search backends
+# ---------------------------------------------------------------------------
+
+
+def _select_provider(
+    source_type: SourceType,
+    research_mode: str,
+    has_tavily: bool,
+) -> str:
+    """Select primary search provider based on mode and source type.
+
+    Academic always uses Exa (semantic advantage).
+    Web/news use Tavily in fast mode when available, otherwise Exa.
+    """
+    if source_type == "academic":
+        return "exa"
+    if research_mode == "fast" and has_tavily:
+        return "tavily"
+    return "exa"
+
+
+async def _search_tavily(
+    client: AsyncTavilyClient,
+    query: str,
+    source_type: SourceType,  # noqa: ARG001
+) -> list[object]:
+    """Execute a Tavily basic search and return results mapped to Exa-compatible dicts."""
+    resp = await client.search(
+        query,
+        search_depth="basic",
+        max_results=5,
+        include_raw_content=True,
+    )
+    results: list[object] = []
+    for r in resp.get("results", []):
+        results.append(
+            _TavilyResult(
+                url=r.get("url", ""),
+                title=r.get("title", ""),
+                text=r.get("content") or r.get("raw_content") or "",
+                published_date=r.get("published_date"),
+            )
+        )
+    return results
+
+
+async def _search_brave(api_key: str, query: str) -> list[object]:
+    """Execute a Brave Search request and return results mapped to Exa-compatible dicts."""
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://api.search.brave.com/res/v1/web/search",
+            headers={"X-Subscription-Token": api_key, "Accept": "application/json"},
+            params={"q": query, "count": 5},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+    results: list[object] = []
+    for h in r.json().get("web", {}).get("results", []):
+        results.append(
+            _TavilyResult(
+                url=h.get("url", ""),
+                title=h.get("title", ""),
+                text=h.get("description", ""),
+                published_date=None,
+            )
+        )
+    return results
+
+
+class _TavilyResult:
+    """Minimal duck-type compatible with Exa result attribute access."""
+
+    __slots__ = ("url", "title", "text", "highlights", "published_date")
+
+    def __init__(
+        self,
+        url: str,
+        title: str,
+        text: str,
+        published_date: str | None,
+    ) -> None:
+        self.url = url
+        self.title = title
+        self.text = text
+        self.highlights: list[str] = []
+        self.published_date = published_date
+
+
+# ---------------------------------------------------------------------------
 # LLM extraction (with retry)
 # ---------------------------------------------------------------------------
 
@@ -455,15 +547,42 @@ async def worker_node(
     worker_id: str = state["worker_id"]
     sub_query: str = state["sub_query"]
     source_type: SourceType = state["source_type"]
-
-    # Validate source_type before any API call
-    _get_exa_params(sub_query, source_type)
+    research_mode: str = state.get("research_mode", "fast")  # type: ignore[attr-defined]
 
     exa_client: AsyncExa = runtime.context.exa_client
     llm: BaseChatModel = runtime.context.llm_worker
+    tavily = runtime.context.tavily_client
+    brave_key = runtime.context.brave_api_key
 
-    worker_exa_search(worker_id, sub_query, str(source_type))
-    exa_results = await _search_exa(exa_client, sub_query, source_type)
+    provider = _select_provider(source_type, research_mode, tavily is not None)
+    worker_exa_search(worker_id, sub_query, str(source_type), provider)
+
+    exa_results: list[object]
+    try:
+        if provider == "tavily" and tavily is not None:
+            exa_results = await _search_tavily(tavily, sub_query, source_type)
+        else:
+            # Validate source_type for Exa before calling
+            _get_exa_params(sub_query, source_type)
+            exa_results = await _search_exa(exa_client, sub_query, source_type)
+    except Exception as primary_err:
+        logger.warning(
+            "Primary search failed for '%s': %s — trying Brave fallback",
+            sub_query,
+            primary_err,
+        )
+        if brave_key:
+            try:
+                exa_results = await _search_brave(brave_key, sub_query)
+            except Exception as brave_err:
+                logger.warning("Brave fallback also failed: %s", brave_err)
+                exa_results = []
+        else:
+            exa_results = []
+
+    # Validate source_type for Exa param builder (when not already done above)
+    if provider != "exa":
+        pass  # non-Exa results don't need param validation
     raw_search_results = [_exa_result_to_dict(r) for r in exa_results]
 
     evidence_items, tokens_used = await _extract_all_evidence(

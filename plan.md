@@ -1,323 +1,371 @@
-# Plan: agents/delivery.py
-
-> **Context:** coordinator + grounding_check + critic done (142/142 tests). Next: delivery (final node before END).
+# Deep Research Agent — FastAPI Web UI Plan
 
 ## Problem Statement
 
-The delivery node is the terminal formatting node in the Deep Research Agent pipeline. It transforms the structured `SynthesisOutput` (and optional `CriticOutput`) into a human-readable document in the requested output format. Unlike other agent nodes, delivery performs **pure formatting logic with zero LLM calls**. It must detect the force-delivery case (`revision_count >= 2`, `critic_output.passed == False`) and inject a quality caveat at the top of the output. The node reads `output_format` from state and dispatches to the appropriate renderer (markdown only for now; docx/pdf/pptx are TODO stubs that raise `NotImplementedError`).
+The pipeline only has a CLI interface (`main.py`). Adding a web UI enables browser-based research queries with real-time progress streaming, allowing users to submit queries, observe live status updates as each pipeline node executes, and receive the final research brief rendered as HTML. Target pipeline runtime is 30–90 seconds, making real-time progress feedback essential for UX.
 
 ---
 
-## Answers to Planning Questions
+## Architecture Decision: SSE Streaming
 
-### Q1: What does delivery read from state?
+**SSE over WebSockets and polling.** The pipeline is fire-and-observe: the client submits a query via POST then receives a unidirectional event stream, which exactly matches SSE semantics. Unlike WebSockets, SSE requires no bidirectional communication, uses standard HTTP, works through proxies without special configuration, and auto-reconnects natively in browsers. Polling would require clients to hit a status endpoint every 1–2 seconds for 30–90 seconds — wasteful and slow to surface progress. SSE delivers events instantly as they occur. `sse-starlette` provides a production-ready implementation that integrates cleanly with FastAPI's async architecture and the project's all-async requirement (CLAUDE.md).
 
-| Field | Read | Why |
-|---|---|---|
-| `synthesis` | ✅ | Primary content: topic, executive_summary, findings, risks, gaps, citations |
-| `critic_output` | ✅ | Quality badge: `critic_output.passed` and `final_quality_score` |
-| `output_format` | ✅ | Dispatches to correct renderer |
-| `revision_count` | ✅ | Detects force-delivery case |
-| `cost_usd` | ❌ | Not user-facing |
-| `final_output` | ❌ | This is what we WRITE, not read |
-| `grounding_issues` | ❌ | Already incorporated into critic scoring |
+---
 
-### Q2: What format(s) does it produce?
+## File Structure
 
-- `markdown`: Fully implemented via `render_markdown()` pure function.
-- `docx`, `pdf`, `pptx`: Raise `NotImplementedError("Format not yet implemented")` stubs.
-
-**Why markdown only:** Other formats require external dependencies (python-docx, WeasyPrint, python-pptx) not yet integrated. Markdown is the dev-default format and serves as the reference renderer.
-
-### Q3: State write
-
-Returns `{"final_output": str}` — LangGraph merges this partial update into state.
-
-### Q4: Force-delivery case
-
-**Detection:**
-```python
-is_force_delivered = (
-    state["revision_count"] >= _MAX_REVISIONS
-    and state["critic_output"] is not None
-    and not state["critic_output"].passed
-)
+```
+api/
+  __init__.py          # Package marker
+  server.py            # FastAPI app + endpoints
+  session_store.py     # In-memory SessionState dict
+  pipeline.py          # run_pipeline() coroutine
+static/
+  index.html           # Single-file frontend (no npm, no build step)
+tests/
+  test_api.py          # 15 new tests (added to existing tests/ dir)
 ```
 
-**Caveat text (exact):**
-```
-> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.
-```
+---
 
-Injected at the very top of the markdown output, before the title.
-
-### Q5: LLM call?
-
-**None.** Zero LLM calls, zero token cost. No prompt file needed. No runtime context needed.
-
-### Q6: Graph wiring change in builder.py
+## Session State Design
 
 ```python
-# Add import:
-from agents.delivery import delivery_node
+# api/session_store.py
+from __future__ import annotations
 
-# Add node:
-builder.add_node("delivery", delivery_node)
+import threading
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from typing import Literal
 
-# Update conditional edges (replace END stub):
-builder.add_conditional_edges(
-    "budget_gate",
-    route_after_critic,
-    {"delivery": "delivery", "coordinator": "coordinator"},
-)
+SessionStatus = Literal["pending", "running", "done", "error"]
 
-# Add terminal edge:
-builder.add_edge("delivery", END)
+
+@dataclass
+class SessionState:
+    """State for a single research session.
+
+    Attributes:
+        session_id:   Unique identifier for this session.
+        status:       Current lifecycle status.
+        events:       Buffered SSE payloads for late-joining clients.
+        final_output: Rendered markdown output when done.
+        cost_usd:     Total LLM cost for this session.
+        tokens_used:  Total tokens consumed.
+        error:        Error message if status == "error".
+        created_at:   Session creation timestamp (UTC).
+    """
+
+    session_id: str
+    status: SessionStatus = "pending"
+    events: list[str] = field(default_factory=list)
+    final_output: str | None = None
+    cost_usd: float = 0.0
+    tokens_used: int = 0
+    error: str | None = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+class SessionStore:
+    """Thread-safe in-memory session storage with TTL cleanup."""
+
+    TTL_SECONDS: int = 3600  # 1 hour
+
+    def __init__(self) -> None:
+        self._sessions: dict[str, SessionState] = {}
+        self._lock: threading.Lock = threading.Lock()
+
+    def create(self, session_id: str) -> SessionState:
+        session = SessionState(session_id=session_id)
+        with self._lock:
+            self._sessions[session_id] = session
+        return session
+
+    def get(self, session_id: str) -> SessionState | None:
+        with self._lock:
+            return self._sessions.get(session_id)
+
+    def set(self, session: SessionState) -> None:
+        with self._lock:
+            self._sessions[session.session_id] = session
+
+    def list_expired(self, max_age_seconds: int | None = None) -> list[str]:
+        max_age = max_age_seconds if max_age_seconds is not None else self.TTL_SECONDS
+        cutoff = datetime.utcnow() - timedelta(seconds=max_age)
+        with self._lock:
+            return [sid for sid, s in self._sessions.items() if s.created_at < cutoff]
+
+    def cleanup_expired(self, max_age_seconds: int | None = None) -> int:
+        expired = self.list_expired(max_age_seconds)
+        with self._lock:
+            for sid in expired:
+                self._sessions.pop(sid, None)
+        return len(expired)
+
+
+store = SessionStore()  # module-level singleton
 ```
 
-Remove: the `{"delivery": END, ...}` stub in the current conditional edges map.
+---
 
-### Q7: Estimated token cost
+## API Endpoints
 
-**$0.00** — pure formatting.
-
-### Q8: Tests
-
-24 test cases — see table below.
+| Method | Path | Request Body | Response | Purpose |
+|--------|------|--------------|----------|---------|
+| `POST` | `/research` | `{"query": str, "mode": "fast"\|"research", "format": "markdown"}` | `{"session_id": str}` | Start pipeline in background task |
+| `GET` | `/stream/{session_id}` | — | SSE event stream | Real-time pipeline events |
+| `GET` | `/status/{session_id}` | — | `{"session_id", "status", "cost_usd", "tokens_used", "error"}` | Poll-friendly JSON snapshot |
+| `GET` | `/` | — | `text/html` | Serve `static/index.html` |
 
 ---
 
-## Files to Create / Modify
+## SSE Event Protocol
 
-| Path | Action |
-|---|---|
-| `agents/delivery.py` | **Create** |
-| `agents/__init__.py` | **Update** — export `delivery_node` |
-| `graph/builder.py` | **Update** — wire delivery node, update conditional edges |
-| `tests/test_delivery.py` | **Create** — 24 tests |
+Four event types, emitted in order:
+
+### 1. `event: status`
+One per pipeline phase, sent when a node starts or completes.
+```
+event: status
+data: {"phase": "supervisor", "message": "Classifying intent and decomposing query..."}
+```
+Phases: `supervisor`, `worker`, `coordinator`, `grounding_check`, `critic`, `delivery`
+
+### 2. `event: result`
+Emitted once on successful completion.
+```
+event: result
+data: {"final_output": "# Research Brief\n\n...", "cost_usd": 0.05, "tokens": 1200}
+```
+
+### 3. `event: error`
+Emitted on pipeline failure.
+```
+event: error
+data: {"message": "Cost ceiling exceeded: $1.02 > $1.00"}
+```
+
+### 4. `event: done`
+Always the final event — signals stream closure.
+```
+event: done
+data: 
+```
 
 ---
 
-## Function Signatures (no implementation bodies)
+## Graph Integration
+
+`api/pipeline.py` reuses `_build_context()` and `_build_initial_state()` from `main.py` and calls `build_graph()` unchanged. An `emit` callback is injected so `graph/progress.py` can push SSE events without knowing about FastAPI.
+
+### `run_pipeline()` Signature
 
 ```python
-"""
-agents/delivery.py
+# api/pipeline.py
+async def run_pipeline(
+    session_id: str,
+    query: str,
+    output_format: OutputFormat,
+    research_mode: ResearchMode,
+    emit: Callable[[str, str], None],  # emit(event_type, json_payload)
+) -> None:
+    """Execute the research pipeline and emit SSE events via the emit callback."""
+```
 
-Delivery node: format SynthesisOutput into the requested output format.
+### Progress Event Hooking
 
-Reads:  state["synthesis"], state["critic_output"], state["output_format"],
-        state["revision_count"]
-Writes: state["final_output"]
+Add to `graph/progress.py`:
 
-Pure formatting logic — no LLM calls, no token cost.
-No prompt file needed.
-"""
+```python
+_SSE_CALLBACK: Callable[[str, str], None] | None = None
 
-_QUALITY_CAVEAT_TEMPLATE: str = (
-    "> **QUALITY NOTICE:** This research brief was delivered after reaching "
-    "the maximum revision limit (2 revisions) without meeting the quality "
-    "threshold (score: {score:.2f}/5.0). Review with appropriate scrutiny.\n"
-)
+def set_sse_callback(callback: Callable[[str, str], None] | None) -> None:
+    """Register (or clear) the SSE progress callback."""
+    global _SSE_CALLBACK
+    _SSE_CALLBACK = callback
 
-_MAX_REVISIONS: int = 2  # must match graph/router.py._MAX_REVISIONS
+def _emit_sse(phase: str, message: str) -> None:
+    """Forward a progress event to the registered SSE callback, if any."""
+    if _SSE_CALLBACK is not None:
+        import json
+        _SSE_CALLBACK("status", json.dumps({"phase": phase, "message": message}))
+```
 
+Each existing `*_start()` and `*_done()` function calls `_emit_sse(node, message)` alongside the existing `_emit()` call. `run_pipeline()` calls `set_sse_callback(emit)` at start and `set_sse_callback(None)` in the `finally` block.
 
-def _is_force_delivered(state: ResearchAgentState) -> bool:
-    """Return True if revision_count >= 2 AND critic_output.passed == False."""
-    ...
+### `POST /research` Background Task
 
+```python
+@app.post("/research", response_model=ResearchResponse)
+async def start_research(
+    request: ResearchRequest,
+    background_tasks: BackgroundTasks,
+) -> ResearchResponse:
+    session_id = str(uuid.uuid4())
+    store.create(session_id)
 
-def _build_citation_map(citations: list[Evidence]) -> dict[str, int]:
-    """Build URL → 1-based footnote index mapping from synthesis.citations."""
-    ...
+    def emit(event_type: str, data: str) -> None:
+        session = store.get(session_id)
+        if session is None:
+            return
+        session.events.append(f"{event_type}:{data}")
+        if event_type == "error":
+            session.status = "error"
+            session.error = json.loads(data).get("message") if data else None
+        elif event_type == "result":
+            parsed = json.loads(data)
+            session.final_output = parsed.get("final_output")
+            session.cost_usd = parsed.get("cost_usd", 0.0)
+            session.tokens_used = parsed.get("tokens", 0)
+        elif event_type == "done" and session.status != "error":
+            session.status = "done"
+        store.set(session)
 
+    async def run_task() -> None:
+        session = store.get(session_id)
+        if session is not None:
+            session.status = "running"
+            store.set(session)
+        await run_pipeline(
+            session_id=session_id,
+            query=request.query,
+            output_format=request.format,
+            research_mode=request.mode,
+            emit=emit,
+        )
 
-def _render_finding(finding: Finding, citation_map: dict[str, int]) -> str:
-    """Render a single finding as markdown (### heading, body, [^N] refs)."""
-    ...
+    background_tasks.add_task(run_task)
+    return ResearchResponse(session_id=session_id)
+```
 
+### SSE Endpoint
 
-def _render_citations_section(citations: list[Evidence]) -> str:
-    """Render the References section with footnote definitions.
+```python
+@app.get("/stream/{session_id}")
+async def stream_events(session_id: str) -> EventSourceResponse:
+    session = store.get(session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
 
-    Format: [^1]: [Source Title](URL) - Published: YYYY-MM-DD
-    Returns empty string if citations is empty.
-    """
-    ...
+    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
+        # Replay buffered events for late-joining clients
+        cursor = 0
+        while True:
+            current = store.get(session_id)
+            if current is None:
+                break
+            while cursor < len(current.events):
+                event_type, data = current.events[cursor].split(":", 1)
+                yield {"event": event_type, "data": data}
+                cursor += 1
+                if event_type == "done":
+                    return
+            if current.status in ("done", "error") and cursor >= len(current.events):
+                yield {"event": "done", "data": ""}
+                return
+            await asyncio.sleep(0.1)
 
-
-def _render_quality_badge(
-    critic_output: CriticOutput | None,
-    is_force_delivered: bool,
-) -> str:
-    """Render the quality badge line.
-
-    Outputs:
-      "**Quality: PASS** (4.25/5.0)"    — when critic_output.passed
-      "**Quality: REVIEW RECOMMENDED** (3.50/5.0)"  — when force-delivered
-      "**Quality: N/A**"                 — when critic_output is None
-    """
-    ...
-
-
-def render_markdown(
-    synthesis: SynthesisOutput,
-    critic_output: CriticOutput | None,
-    is_force_delivered: bool,
-) -> str:
-    """Render SynthesisOutput as a complete markdown document.
-
-    Pure function: no side effects, no LLM calls, deterministic output.
-
-    Section order:
-        1. Quality caveat (ONLY if force-delivered)
-        2. # {topic}
-        3. Quality badge line
-        4. ## Executive Summary
-        5. ## Key Findings (### per finding, [^N] footnote refs)
-        6. ## Risks  (omit if empty)
-        7. ## Known Gaps  (omit if empty)
-        8. ## References (footnote definitions, omit if no citations)
-    """
-    ...
-
-
-async def delivery_node(
-    state: ResearchAgentState,
-) -> dict[str, str]:
-    """LangGraph node: format synthesis into the requested output format.
-
-    Note: no Runtime parameter — no LLM client needed.
-
-    Raises:
-        ValueError: If synthesis is None.
-        NotImplementedError: If output_format is "docx", "pdf", or "pptx".
-    """
-    ...
+    return EventSourceResponse(event_generator())
 ```
 
 ---
 
-## render_markdown() Output Specification
+## Frontend UX
 
-### Section order (exact)
+Single `static/index.html` — no npm, no build step, no CDN build tools. Uses `marked.js` via CDN for markdown rendering.
 
-```
-1. [Quality caveat — only if force-delivered]
-2. # {topic}
-3. {quality_badge}
-4. ## Executive Summary
-   {executive_summary}
-5. ## Key Findings
-   ### {finding.heading}
-   {finding.body}[^i][^j]
-6. ## Risks         [omit if empty]
-   - {risk}
-7. ## Known Gaps    [omit if empty]
-   - {gap}
-8. ## References    [omit if no citations]
-   [^1]: [Title](URL) - Published: date
-```
+**Layout:**
+1. **Form** — query textarea, fast/research radio buttons, Submit button (disabled during run)
+2. **Progress area** — live status events as a vertical timeline with timestamps and phase badges
+3. **Results area** — final output rendered HTML (hidden until `result` event received)
+4. **Stats bar** — `$cost`, token count, elapsed duration (shown on completion)
 
-### Example (force-delivered, score 3.50)
+**Key JS pattern:**
+```javascript
+const res = await fetch('/research', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({query, mode, format: 'markdown'})
+});
+const {session_id} = await res.json();
 
-```markdown
-> **QUALITY NOTICE:** This research brief was delivered after reaching the maximum revision limit (2 revisions) without meeting the quality threshold (score: 3.50/5.0). Review with appropriate scrutiny.
-
-# Renewable Energy Investment Trends 2025
-
-**Quality: REVIEW RECOMMENDED** (3.50/5.0)
-
-## Executive Summary
-
-Global renewable energy investments reached $500 billion in 2024...
-
-## Key Findings
-
-### Solar Costs Continue to Decline
-
-The levelized cost of solar energy dropped 12% year-over-year.[^1][^2]
-
-## Risks
-
-- Supply chain constraints may slow deployment in 2025
-
-## Known Gaps
-
-- Limited data on emerging markets
-
-## References
-
-[^1]: [IEA World Energy Outlook 2024](https://iea.org/reports/weo-2024) - Published: 2024-10-15
-[^2]: [BloombergNEF Solar Report](https://about.bnef.com/solar) - Published: 2024-09-20
-```
-
-### Example (passed, score 4.25)
-
-```markdown
-# Renewable Energy Investment Trends 2025
-
-**Quality: PASS** (4.25/5.0)
-
-## Executive Summary
-...
+const es = new EventSource(`/stream/${session_id}`);
+es.addEventListener('status', e => addEvent(JSON.parse(e.data)));
+es.addEventListener('result', e => renderResult(JSON.parse(e.data)));
+es.addEventListener('error', e => showError(JSON.parse(e.data)));
+es.addEventListener('done', () => { es.close(); submitBtn.disabled = false; });
 ```
 
 ---
 
-## Test Cases (24)
+## New Dependencies
 
-| # | Test | Assertion |
-|---|---|---|
-| 1 | `test_delivery_node_returns_final_output_key` | `"final_output" in result` |
-| 2 | `test_final_output_is_string` | `isinstance(result["final_output"], str)` |
-| 3 | `test_markdown_contains_topic_as_title` | `"# Test Topic"` in output |
-| 4 | `test_markdown_contains_executive_summary_heading` | `"## Executive Summary"` in output |
-| 5 | `test_markdown_contains_all_finding_headings` | All finding headings as `###` in output |
-| 6 | `test_findings_have_footnote_refs` | `[^1]` appears in finding body |
-| 7 | `test_risks_section_present_when_nonempty` | `"## Risks"` in output |
-| 8 | `test_gaps_section_present_when_nonempty` | `"## Known Gaps"` in output |
-| 9 | `test_citations_section_present` | `"## References"` and `[^1]:` in output |
-| 10 | `test_quality_badge_pass` | `"Quality: PASS"` in output when `critic_output.passed=True` |
-| 11 | `test_quality_badge_review_recommended` | `"Quality: REVIEW RECOMMENDED"` when force-delivered |
-| 12 | `test_force_delivery_caveat_injected_at_top` | `"QUALITY NOTICE:"` is first non-empty line |
-| 13 | `test_force_delivery_caveat_contains_score` | `"3.50/5.0"` in caveat string |
-| 14 | `test_no_caveat_when_critic_passed` | `"QUALITY NOTICE"` not in output |
-| 15 | `test_no_caveat_when_revision_under_cap` | `revision_count=1, passed=False` → no caveat |
-| 16 | `test_synthesis_none_raises_value_error` | `ValueError` before any rendering |
-| 17 | `test_output_format_markdown_produces_output` | `len(result["final_output"]) > 0` |
-| 18 | `test_output_format_docx_raises_not_implemented` | `NotImplementedError` |
-| 19 | `test_output_format_pdf_raises_not_implemented` | `NotImplementedError` |
-| 20 | `test_output_format_pptx_raises_not_implemented` | `NotImplementedError` |
-| 21 | `test_render_markdown_is_pure` | Same args → identical output on two calls |
-| 22 | `test_citations_format_url_and_title` | `[Title](URL)` pattern in References |
-| 23 | `test_empty_risks_omits_section` | `"## Risks"` NOT in output when `risks=[]` |
-| 24 | `test_empty_gaps_omits_section` | `"## Known Gaps"` NOT in output when `gaps=[]` |
+| Package | Version | Purpose |
+|---------|---------|---------|
+| `fastapi` | `>=0.109.0` | Web framework |
+| `uvicorn[standard]` | `>=0.27.0` | ASGI server |
+| `sse-starlette` | `>=2.0.0` | SSE via EventSourceResponse |
+| `python-multipart` | `>=0.0.6` | Form parsing (FastAPI requirement) |
+
+Add to `requirements.txt` under a new `# ── Web API ──` section.
+
+---
+
+## Tests to Add
+
+| File | Count | What |
+|------|-------|------|
+| `tests/test_api.py` | +3 | SessionStore: create returns pending, get returns None for missing, list_expired finds old sessions |
+| `tests/test_api.py` | +2 | POST /research: returns 200 + UUID session_id; accepts research mode |
+| `tests/test_api.py` | +1 | GET / returns 200 HTML |
+| `tests/test_api.py` | +2 | GET /status: returns session state; 404 for missing session |
+| `tests/test_api.py` | +1 | GET /stream: 404 for unknown session_id |
+| `tests/test_api.py` | +4 | SSE stream events: status → result → done order; error event sets session.status |
+| `tests/test_api.py` | +2 | run_pipeline: emits correct event sequence with mocked graph |
+
+**Total: 15 new tests**
 
 ---
 
 ## Failure Modes
 
-| Failure | Cause | Mitigation |
-|---|---|---|
-| `synthesis is None` | delivery called before coordinator | `ValueError` |
-| `critic_output is None` | edge case — critic skipped | Badge shows `N/A` |
-| Unsupported `output_format` | docx/pdf/pptx request | `NotImplementedError` |
-| Empty `findings` | coordinator edge case | `## Key Findings` section renders empty |
-| URL not in `citation_map` | evidence_ref not in citations | Append URL inline without footnote |
-| `revision_count > _MAX_REVISIONS` | router bug | `>= 2` check still fires correctly |
+| Failure | Mitigation |
+|---------|------------|
+| Session not found | HTTP 404 on `/stream/` and `/status/` |
+| Pipeline raises exception | `run_pipeline` `try/except` emits `error` event, sets `session.status = "error"` |
+| Client disconnects mid-stream | EventSourceResponse handles disconnect gracefully; session state persists for `/status` retrieval |
+| Memory leak from old sessions | TTL cleanup (`store.cleanup_expired()`) runs on startup and every 10 min via `asyncio.create_task` |
+| Concurrent access to session state | `threading.Lock` in `SessionStore` |
+| SSE client timeout (browser ~45s default) | Client-side `EventSource` auto-reconnects; buffered `session.events` replayed so no data lost |
 
 ---
 
-## Architect Notes
+## Cost / Performance Impact
 
-1. **No `runtime` parameter** — same pattern as `boundary_compressor_node`. Signature is `async def delivery_node(state: ResearchAgentState) -> dict[str, str]`.
+**LLM cost:** Zero change — no new LLM calls.
 
-2. **`_MAX_REVISIONS = 2`** — must be kept in sync with `graph/router.py._MAX_REVISIONS`. Do not import from router (circular import risk); declare as a local constant.
+**Memory overhead:**
+- Each `SessionState`: ~2–5 KB (event buffer strings)
+- 1-hour TTL + 10-min cleanup → at most ~360 sessions in memory
+- Worst case: ~1.8 MB
 
-3. **`render_markdown` exported** — for direct testing and future reuse by docx/pptx renderers as a reference.
+**Latency:** SSE poll interval 100ms — negligible. No additional network round-trips vs CLI.
 
-4. **Section blank lines** — separate each section with a double newline (`\n\n`) for valid markdown rendering.
+---
 
-5. **Footnote refs in findings** — only include `[^N]` for URLs present in `citation_map`; silently skip unknown refs.
+## Run Commands
+
+```bash
+# Install new deps
+pip install -r requirements.txt
+
+# Start development server
+uvicorn api.server:app --reload --port 8000
+
+# Run all tests including new API tests
+pytest tests/ -v
+
+# Type check new API files
+mypy api/ --strict
+```

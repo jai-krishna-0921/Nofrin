@@ -34,9 +34,13 @@ Usage — inside a node:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from exa_py import AsyncExa
 from langchain_core.language_models import BaseChatModel
+
+if TYPE_CHECKING:
+    from tavily import AsyncTavilyClient
 
 
 @dataclass
@@ -63,6 +67,8 @@ class NofrinContext:
     exa_client: AsyncExa
     session_id: str
     cost_ceiling_usd: float = field(default=1.00)
+    tavily_client: AsyncTavilyClient | None = None
+    brave_api_key: str | None = None
 
 
 __all__ = ["NofrinContext"]

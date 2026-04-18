@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Deep Research Agent</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0f1117;
+      --surface:   #1a1d27;
+      --border:    #2a2d3a;
+      --accent:    #6366f1;
+      --accent-dim:#4f52c8;
+      --text:      #e2e4ed;
+      --muted:     #6b7280;
+      --success:   #22c55e;
+      --warn:      #f59e0b;
+      --error:     #ef4444;
+      --radius:    8px;
+      --font:      'Inter', system-ui, sans-serif;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 15px;
+      line-height: 1.6;
+      min-height: 100vh;
+      padding: 32px 16px 64px;
+    }
+
+    .container { max-width: 820px; margin: 0 auto; }
+
+    /* Header */
+    header { margin-bottom: 32px; }
+    header h1 { font-size: 1.6rem; font-weight: 700; letter-spacing: -0.02em; }
+    header p  { color: var(--muted); font-size: 0.875rem; margin-top: 4px; }
+
+    /* Card */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      margin-bottom: 16px;
+    }
+
+    /* Form */
+    label { display: block; font-size: 0.8rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+    textarea {
+      width: 100%; min-height: 96px; resize: vertical;
+      background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
+      color: var(--text); font-family: var(--font); font-size: 0.95rem; padding: 10px 12px;
+      outline: none; transition: border-color .15s;
+    }
+    textarea:focus { border-color: var(--accent); }
+
+    .mode-row { display: flex; gap: 12px; margin-top: 14px; flex-wrap: wrap; }
+    .mode-option {
+      display: flex; align-items: center; gap: 8px; cursor: pointer;
+      border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 14px;
+      background: var(--bg); transition: border-color .15s, background .15s; font-size: 0.875rem;
+    }
+    .mode-option:has(input:checked) { border-color: var(--accent); background: #1e1f35; }
+    .mode-option input { accent-color: var(--accent); }
+    .mode-label { font-weight: 500; }
+    .mode-desc  { color: var(--muted); font-size: 0.78rem; }
+
+    .submit-row { margin-top: 14px; display: flex; align-items: center; gap: 12px; }
+    button#submit-btn {
+      background: var(--accent); color: #fff; border: none;
+      border-radius: var(--radius); padding: 10px 22px;
+      font-size: 0.9rem; font-weight: 600; cursor: pointer;
+      transition: background .15s, opacity .15s;
+    }
+    button#submit-btn:hover:not(:disabled) { background: var(--accent-dim); }
+    button#submit-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    #status-text { color: var(--muted); font-size: 0.825rem; }
+
+    /* Progress timeline */
+    #progress-section { display: none; }
+    #progress-section h2 { font-size: 0.8rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px; }
+    #timeline { display: flex; flex-direction: column; gap: 6px; max-height: 280px; overflow-y: auto; }
+    .tl-item {
+      display: flex; align-items: flex-start; gap: 10px;
+      font-size: 0.82rem; padding: 2px 0;
+    }
+    .tl-ts   { color: var(--muted); font-size: 0.75rem; white-space: nowrap; padding-top: 1px; min-width: 56px; }
+    .tl-badge {
+      display: inline-block; padding: 1px 7px; border-radius: 4px;
+      font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+      white-space: nowrap;
+    }
+    .badge-supervisor    { background: #312e81; color: #a5b4fc; }
+    .badge-coordinator   { background: #1e3a5f; color: #93c5fd; }
+    .badge-grounding_check { background: #14532d; color: #86efac; }
+    .badge-critic        { background: #451a03; color: #fcd34d; }
+    .badge-delivery      { background: #1a2e05; color: #a3e635; }
+    .badge-pipeline      { background: #1f2937; color: #9ca3af; }
+    .badge-error         { background: #450a0a; color: #fca5a5; }
+    .badge-done          { background: #052e16; color: #6ee7b7; }
+    .tl-msg { color: var(--text); }
+
+    /* Result */
+    #result-section { display: none; }
+    #result-section h2 { font-size: 0.8rem; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 12px; }
+    #result-body {
+      font-size: 0.92rem; line-height: 1.75;
+    }
+    #result-body h1,#result-body h2,#result-body h3 { margin: 1.1em 0 0.4em; font-weight: 600; }
+    #result-body h1 { font-size: 1.3rem; }
+    #result-body h2 { font-size: 1.1rem; color: #a5b4fc; }
+    #result-body h3 { font-size: 0.95rem; color: #93c5fd; }
+    #result-body p  { margin-bottom: 0.75em; }
+    #result-body ul,#result-body ol { padding-left: 1.4em; margin-bottom: 0.75em; }
+    #result-body li { margin-bottom: 0.25em; }
+    #result-body code { background: #1f2937; border-radius: 3px; padding: 1px 5px; font-size: 0.875em; }
+    #result-body pre  { background: #1f2937; border-radius: 6px; padding: 12px; overflow-x: auto; margin-bottom: 0.75em; }
+    #result-body blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--muted); margin-bottom: 0.75em; }
+    #result-body a { color: #818cf8; text-decoration: underline; text-underline-offset: 2px; }
+
+    /* Stats */
+    #stats-section { display: none; }
+    .stats-grid { display: flex; gap: 24px; flex-wrap: wrap; }
+    .stat { text-align: center; }
+    .stat-val { font-size: 1.3rem; font-weight: 700; color: var(--accent); }
+    .stat-lbl { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; }
+
+    /* Error banner */
+    #error-banner { display: none; background: #450a0a; border: 1px solid #7f1d1d; border-radius: var(--radius); padding: 12px 16px; color: #fca5a5; font-size: 0.875rem; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Deep Research Agent</h1>
+    <p>AI-powered research with real-time progress — powered by LangGraph</p>
+  </header>
+
+  <!-- Query form -->
+  <div class="card">
+    <label for="query-input">Research question</label>
+    <textarea id="query-input" placeholder="What would you like to research? e.g. 'What are the latest advances in fusion energy?'"></textarea>
+
+    <div class="mode-row">
+      <label class="mode-option">
+        <input type="radio" name="mode" value="fast" checked>
+        <span>
+          <span class="mode-label">Fast</span><br>
+          <span class="mode-desc">3 queries · no revision · ~$0.07</span>
+        </span>
+      </label>
+      <label class="mode-option">
+        <input type="radio" name="mode" value="research">
+        <span>
+          <span class="mode-label">Research</span><br>
+          <span class="mode-desc">5 queries · 2 revisions · ~$0.30</span>
+        </span>
+      </label>
+    </div>
+
+    <div class="submit-row">
+      <button id="submit-btn" type="button">Start Research</button>
+      <span id="status-text"></span>
+    </div>
+  </div>
+
+  <!-- Error banner -->
+  <div id="error-banner"></div>
+
+  <!-- Progress timeline -->
+  <div id="progress-section" class="card">
+    <h2>Progress</h2>
+    <div id="timeline"></div>
+  </div>
+
+  <!-- Stats bar -->
+  <div id="stats-section" class="card">
+    <div class="stats-grid">
+      <div class="stat"><div class="stat-val" id="stat-cost">—</div><div class="stat-lbl">Cost (USD)</div></div>
+      <div class="stat"><div class="stat-val" id="stat-tokens">—</div><div class="stat-lbl">Tokens</div></div>
+      <div class="stat"><div class="stat-val" id="stat-elapsed">—</div><div class="stat-lbl">Elapsed</div></div>
+    </div>
+  </div>
+
+  <!-- Result -->
+  <div id="result-section" class="card">
+    <h2>Research Brief</h2>
+    <div id="result-body"></div>
+  </div>
+</div>
+
+<script>
+  const submitBtn  = document.getElementById('submit-btn');
+  const statusText = document.getElementById('status-text');
+  const timeline   = document.getElementById('timeline');
+  const progressSec = document.getElementById('progress-section');
+  const resultSec  = document.getElementById('result-section');
+  const resultBody = document.getElementById('result-body');
+  const statsSec   = document.getElementById('stats-section');
+  const errBanner  = document.getElementById('error-banner');
+
+  let startTime = null;
+
+  function ts() {
+    const now = new Date();
+    return now.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit', second:'2-digit'});
+  }
+
+  function addEvent(phase, message) {
+    const item = document.createElement('div');
+    item.className = 'tl-item';
+    const badgeClass = 'badge-' + (phase || 'pipeline');
+    item.innerHTML = `<span class="tl-ts">${ts()}</span><span class="tl-badge ${badgeClass}">${phase}</span><span class="tl-msg">${message}</span>`;
+    timeline.appendChild(item);
+    timeline.scrollTop = timeline.scrollHeight;
+  }
+
+  function showError(msg) {
+    errBanner.textContent = '⚠ ' + msg;
+    errBanner.style.display = 'block';
+    addEvent('error', msg);
+  }
+
+  function reset() {
+    timeline.innerHTML = '';
+    resultBody.innerHTML = '';
+    resultSec.style.display = 'none';
+    statsSec.style.display = 'none';
+    progressSec.style.display = 'block';
+    errBanner.style.display = 'none';
+    errBanner.textContent = '';
+    startTime = Date.now();
+  }
+
+  submitBtn.addEventListener('click', async () => {
+    const query = document.getElementById('query-input').value.trim();
+    if (!query) { showError('Please enter a research question.'); return; }
+
+    const mode = document.querySelector('input[name="mode"]:checked').value;
+    reset();
+    submitBtn.disabled = true;
+    statusText.textContent = 'Starting…';
+
+    let res;
+    try {
+      res = await fetch('/research', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({query, mode, format: 'markdown'})
+      });
+      if (!res.ok) { throw new Error(`HTTP ${res.status}: ${await res.text()}`); }
+    } catch (err) {
+      showError(err.message);
+      submitBtn.disabled = false;
+      statusText.textContent = '';
+      return;
+    }
+
+    const {session_id} = await res.json();
+    statusText.textContent = `Session ${session_id.slice(0, 8)}…`;
+
+    const es = new EventSource(`/stream/${session_id}`);
+
+    es.addEventListener('status', e => {
+      const d = JSON.parse(e.data);
+      addEvent(d.phase, d.message);
+      statusText.textContent = d.message;
+    });
+
+    es.addEventListener('result', e => {
+      const d = JSON.parse(e.data);
+      resultBody.innerHTML = marked.parse(d.final_output || '');
+      resultSec.style.display = 'block';
+      document.getElementById('stat-cost').textContent = '$' + (d.cost_usd || 0).toFixed(4);
+      document.getElementById('stat-tokens').textContent = (d.tokens || 0).toLocaleString();
+      document.getElementById('stat-elapsed').textContent = ((Date.now() - startTime) / 1000).toFixed(1) + 's';
+      statsSec.style.display = 'block';
+    });
+
+    es.addEventListener('error', e => {
+      if (e.data) {
+        try { showError(JSON.parse(e.data).message); }
+        catch { showError(e.data); }
+      }
+    });
+
+    es.addEventListener('done', () => {
+      es.close();
+      submitBtn.disabled = false;
+      statusText.textContent = 'Done';
+      addEvent('done', 'Pipeline complete');
+    });
+
+    es.onerror = () => {
+      es.close();
+      submitBtn.disabled = false;
+      statusText.textContent = '';
+    };
+  });
+</script>
+</body>
+</html>

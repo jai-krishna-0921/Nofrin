@@ -23,6 +23,7 @@ SourceType = Literal["web", "academic", "news"]
 IntentType = Literal["exploratory", "comparative", "adversarial", "factual"]
 OutputFormat = Literal["markdown", "docx", "pdf", "pptx"]
 IssueSeverity = Literal["critical", "major", "minor"]
+ResearchMode = Literal["fast", "research"]
 
 # ---------------------------------------------------------------------------
 # Supporting dataclasses — in dependency order
@@ -148,6 +149,7 @@ class WorkerInput(TypedDict):
     worker_id: str
     sub_query: str
     source_type: SourceType
+    research_mode: ResearchMode
 
 
 class ResearchAgentState(TypedDict):
@@ -162,6 +164,7 @@ class ResearchAgentState(TypedDict):
     user_query: str
     intent_type: IntentType
     output_format: OutputFormat
+    research_mode: ResearchMode  # "fast" or "research"
 
     # --- Decomposition (set by supervisor node) ---
     sub_queries: list[str]
@@ -202,6 +205,7 @@ __all__ = [
     "IntentType",
     "OutputFormat",
     "IssueSeverity",
+    "ResearchMode",
     # Dataclasses
     "Evidence",
     "Finding",

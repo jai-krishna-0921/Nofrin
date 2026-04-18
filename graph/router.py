@@ -31,7 +31,13 @@ from langgraph.runtime import Runtime
 from langgraph.types import Send
 
 from graph.context import NofrinContext
-from graph.state import ResearchAgentState, SourceType, SynthesisOutput, WorkerInput
+from graph.state import (
+    ResearchAgentState,
+    ResearchMode,
+    SourceType,
+    SynthesisOutput,
+    WorkerInput,
+)
 
 # Fraction of the cost ceiling that triggers a forced delivery.
 _BUDGET_THRESHOLD = 0.75
@@ -74,6 +80,7 @@ def dispatch_workers(
             "supervisor_node must populate sub_queries before dispatch."
         )
 
+    research_mode: ResearchMode = state.get("research_mode", "fast")  # type: ignore[assignment]
     sends: list[Send] = []
     for idx, sub_query in enumerate(sub_queries):
         source_type: SourceType = source_routing.get(sub_query, "web")
@@ -81,6 +88,7 @@ def dispatch_workers(
             worker_id=f"worker-{idx}",
             sub_query=sub_query,
             source_type=source_type,
+            research_mode=research_mode,
         )
         sends.append(Send("worker", worker_input))
 
@@ -149,6 +157,10 @@ def route_after_critic(
     Returns:
         "delivery" or "coordinator".
     """
+    # 0. Fast mode: skip revision loop entirely.
+    if state.get("research_mode", "fast") == "fast":
+        return "delivery"
+
     cost_usd: float = state["cost_usd"]
     cost_ceiling: float = runtime.context.cost_ceiling_usd
 

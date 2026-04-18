@@ -29,17 +29,18 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from graph.builder import build_graph
-from graph.progress import pipeline_done, pipeline_start
-from graph.context import NofrinContext
-from graph.llm import get_llm
-from graph.state import OutputFormat, ResearchAgentState
+from graph.builder import build_graph  # noqa: E402
+from graph.progress import pipeline_done, pipeline_start, pipeline_summary  # noqa: E402
+from graph.context import NofrinContext  # noqa: E402
+from graph.llm import get_llm  # noqa: E402
+from graph.state import OutputFormat, ResearchAgentState, ResearchMode  # noqa: E402
 
 
 def _build_initial_state(
     query: str,
     output_format: OutputFormat,
     session_id: str,
+    research_mode: ResearchMode = "fast",
 ) -> ResearchAgentState:
     """Build a fresh ResearchAgentState for a new research session.
 
@@ -47,6 +48,7 @@ def _build_initial_state(
         query: The user's research query.
         output_format: Requested output format.
         session_id: Unique session identifier.
+        research_mode: "fast" (default) or "research".
 
     Returns:
         Fully initialised ResearchAgentState with all required fields.
@@ -55,6 +57,7 @@ def _build_initial_state(
         user_query=query,
         intent_type="exploratory",  # supervisor will classify; this is the init default
         output_format=output_format,
+        research_mode=research_mode,
         sub_queries=[],
         source_routing={},
         worker_results=[],
@@ -84,6 +87,17 @@ def _build_context(session_id: str) -> NofrinContext:
 
     exa_key = os.environ.get("EXA_API_KEY", "")
     cost_ceiling = float(os.getenv("COST_CEILING_USD", "1.00"))
+    tavily_key = os.environ.get("TAVILY_API_KEY", "")
+    brave_key = os.environ.get("BRAVE_API_KEY", "") or None
+
+    tavily_client = None
+    if tavily_key:
+        try:
+            from tavily import AsyncTavilyClient  # noqa: PLC0415
+
+            tavily_client = AsyncTavilyClient(api_key=tavily_key)
+        except ImportError:
+            pass
 
     return NofrinContext(
         llm_supervisor=get_llm(role="default"),
@@ -93,6 +107,8 @@ def _build_context(session_id: str) -> NofrinContext:
         exa_client=AsyncExa(api_key=exa_key),
         session_id=session_id,
         cost_ceiling_usd=cost_ceiling,
+        tavily_client=tavily_client,
+        brave_api_key=brave_key,
     )
 
 
@@ -100,6 +116,7 @@ async def _run(
     query: str,
     output_format: OutputFormat,
     session_id: str,
+    research_mode: ResearchMode = "fast",
 ) -> int:
     """Run the research pipeline and print results.
 
@@ -108,7 +125,9 @@ async def _run(
     """
     graph = build_graph()
     context = _build_context(session_id)
-    initial_state = _build_initial_state(query, output_format, session_id)
+    initial_state = _build_initial_state(
+        query, output_format, session_id, research_mode
+    )
 
     pipeline_start(query)
     result: dict[str, object] = await graph.ainvoke(  # type: ignore[call-overload]
@@ -124,6 +143,7 @@ async def _run(
 
     if isinstance(final_output, str) and final_output:
         pipeline_done(cost, tokens)
+        pipeline_summary()
         print(final_output)
     else:
         print("[No output produced]", file=sys.stderr)
@@ -152,6 +172,13 @@ def main() -> None:
         help="Output format (default: markdown).",
     )
     parser.add_argument(
+        "--mode",
+        dest="research_mode",
+        choices=["fast", "research"],
+        default="fast",
+        help="'fast' (3 queries, no revision) or 'research' (5 queries, 2 revisions). Default: fast.",
+    )
+    parser.add_argument(
         "--session-id",
         dest="session_id",
         default=None,
@@ -161,9 +188,12 @@ def main() -> None:
     args = parser.parse_args()
     session_id: str = args.session_id or str(uuid.uuid4())
     output_format: OutputFormat = args.output_format
+    research_mode: ResearchMode = args.research_mode
 
     try:
-        exit_code = asyncio.run(_run(args.query, output_format, session_id))
+        exit_code = asyncio.run(
+            _run(args.query, output_format, session_id, research_mode)
+        )
         sys.exit(exit_code)
     except KeyboardInterrupt:
         print("\n[Interrupted]", file=sys.stderr)

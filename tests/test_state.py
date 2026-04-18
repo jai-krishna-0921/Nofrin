@@ -21,6 +21,7 @@ from graph.state import (
     CriticOutput,
     WorkerInput,
     ResearchAgentState,
+    ResearchMode,
     SourceType,
     IntentType,
     OutputFormat,
@@ -350,6 +351,7 @@ def test_research_agent_state_is_typeddict():
         "user_query": "test query",
         "intent_type": "factual",
         "output_format": "markdown",
+        "research_mode": "research",
         "sub_queries": [],
         "source_routing": {},
         "worker_results": [],
@@ -386,6 +388,7 @@ def test_worker_input_typeddict():
         "worker_id": "worker_003",
         "sub_query": "What are the key features of Python 3.11?",
         "source_type": "web",
+        "research_mode": "research",
     }
 
     # Verify it's a dict
@@ -418,6 +421,7 @@ def test_source_type_literals():
             "worker_id": "test",
             "sub_query": "test",
             "source_type": source,
+            "research_mode": "research",
         }
         assert worker_input["source_type"] == source
 
@@ -459,3 +463,23 @@ def test_issue_severity_literals():
             severity=severity,
         )
         assert issue.severity == severity
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: ResearchMode type alias and field tests
+# ---------------------------------------------------------------------------
+
+
+def test_research_mode_type_alias_exists() -> None:
+    """ResearchMode is importable from graph.state as a Literal type alias."""
+    # ResearchMode should be importable (already imported at top of file)
+    valid_modes: list[ResearchMode] = ["fast", "research"]
+    for mode in valid_modes:
+        state: dict[str, str] = {"research_mode": mode}
+        assert state["research_mode"] == mode
+
+
+def test_research_agent_state_has_research_mode_field() -> None:
+    """research_mode field is present in ResearchAgentState type hints."""
+    hints = get_type_hints(ResearchAgentState)
+    assert "research_mode" in hints

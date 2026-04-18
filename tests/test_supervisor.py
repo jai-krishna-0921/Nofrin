@@ -40,6 +40,7 @@ def base_state() -> ResearchAgentState:
         user_query="What are the trends in renewable energy?",
         intent_type="factual",  # Will be overwritten by supervisor
         output_format="markdown",
+        research_mode="research",
         sub_queries=[],
         source_routing={},
         worker_results=[],
@@ -427,6 +428,95 @@ def test_validate_output_invalid_source_type() -> None:
 
     with pytest.raises(AgentParseError, match="Invalid source_type 'website'"):
         _validate_output(output)
+
+
+# ---------------------------------------------------------------------------
+# Feature 1: Fast mode validation tests
+# ---------------------------------------------------------------------------
+
+
+def test_validate_output_fast_mode_exact_3_passes() -> None:
+    """Fast mode with exactly 3 sub-queries passes validation without exception."""
+    output = SupervisorOutput(
+        intent_type="exploratory",
+        sub_queries=[
+            SubQueryItem(query="q1", source_type="web", rationale="r1"),
+            SubQueryItem(query="q2", source_type="academic", rationale="r2"),
+            SubQueryItem(query="q3", source_type="news", rationale="r3"),
+        ],
+    )
+    # Should not raise
+    _validate_output(output, research_mode="fast")
+
+
+def test_validate_output_fast_mode_rejects_4_queries() -> None:
+    """Fast mode with 4 sub-queries raises AgentParseError."""
+    output = SupervisorOutput(
+        intent_type="exploratory",
+        sub_queries=[
+            SubQueryItem(query=f"q{i}", source_type="web", rationale="r")
+            for i in range(4)
+        ],
+    )
+    with pytest.raises(
+        AgentParseError, match="Fast mode requires exactly 3 sub-queries"
+    ):
+        _validate_output(output, research_mode="fast")
+
+
+def test_validate_output_fast_mode_rejects_2_queries() -> None:
+    """Fast mode with 2 sub-queries raises AgentParseError."""
+    output = SupervisorOutput(
+        intent_type="exploratory",
+        sub_queries=[
+            SubQueryItem(query="q1", source_type="web", rationale="r1"),
+            SubQueryItem(query="q2", source_type="web", rationale="r2"),
+        ],
+    )
+    with pytest.raises(
+        AgentParseError, match="Fast mode requires exactly 3 sub-queries"
+    ):
+        _validate_output(output, research_mode="fast")
+
+
+@pytest.mark.asyncio
+async def test_supervisor_node_fast_mode_returns_3_queries(
+    mock_runtime: MagicMock,
+) -> None:
+    """supervisor_node with research_mode='fast' returns exactly 3 sub-queries."""
+    fast_state: ResearchAgentState = ResearchAgentState(
+        user_query="Quick fact check query",
+        intent_type="factual",
+        output_format="markdown",
+        research_mode="fast",
+        sub_queries=[],
+        source_routing={},
+        worker_results=[],
+        synthesis=None,
+        grounding_issues=[],
+        critic_output=None,
+        revision_count=0,
+        prior_syntheses=[],
+        session_id="test-fast",
+        total_tokens_used=0,
+        cost_usd=0.0,
+        final_output=None,
+    )
+    json_response = """{
+        "intent_type": "factual",
+        "sub_queries": [
+            {"query": "fast query one", "source_type": "web", "rationale": "r1"},
+            {"query": "fast query two", "source_type": "news", "rationale": "r2"},
+            {"query": "fast query three", "source_type": "web", "rationale": "r3"}
+        ]
+    }"""
+    mock_response = MagicMock()
+    mock_response.content = json_response
+    mock_runtime.context.llm_supervisor.ainvoke.return_value = mock_response
+
+    result = await supervisor_node(fast_state, mock_runtime)
+
+    assert len(result["sub_queries"]) == 3
 
 
 # ---------------------------------------------------------------------------

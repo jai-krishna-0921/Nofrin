@@ -48,7 +48,7 @@ def _is_anthropic(llm: BaseChatModel) -> bool:
         return False
 
 
-PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "supervisor_v1.txt"
+PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "supervisor_v2.txt"
 
 _VALID_INTENT_TYPES: frozenset[str] = frozenset(
     {"exploratory", "comparative", "adversarial", "factual"}
@@ -104,10 +104,11 @@ class SupervisorOutput:
 
 
 def _load_prompt() -> str:
-    """Load supervisor prompt from prompts/supervisor_v1.txt.
+    """Load supervisor prompt from prompts/supervisor_v2.txt.
 
     Returns:
-        Prompt template string containing {{user_query}} placeholder.
+        Prompt template string containing {{user_query}} and
+        {{num_queries_instruction}} placeholders.
 
     Raises:
         FileNotFoundError: If the prompt file does not exist at PROMPT_PATH.
@@ -115,7 +116,7 @@ def _load_prompt() -> str:
     if not PROMPT_PATH.exists():
         raise FileNotFoundError(
             f"Supervisor prompt not found at {PROMPT_PATH}. "
-            "Ensure prompts/supervisor_v1.txt exists in the project root."
+            "Ensure prompts/supervisor_v2.txt exists in the project root."
         )
     return PROMPT_PATH.read_text(encoding="utf-8")
 
@@ -129,6 +130,7 @@ def _build_messages(
     user_query: str,
     prompt_template: str,
     use_cache_control: bool = False,
+    research_mode: str = "research",
 ) -> list[BaseMessage]:
     """Build the message list for the supervisor LLM call.
 
@@ -140,18 +142,32 @@ def _build_messages(
             dynamic user query in a separate uncached block. For all other
             providers pass False (default) — a plain string SystemMessage
             is returned instead.
+        research_mode: "fast" or "research" — controls the num_queries_instruction
+            injected into the prompt.
 
     Returns:
         List containing a single SystemMessage.
     """
+    if research_mode == "fast":
+        num_queries_instruction = (
+            "Generate EXACTLY 3 sub-queries — no more, no less. "
+            "This is fast mode; 3 sub-queries is a hard requirement."
+        )
+    else:
+        num_queries_instruction = (
+            "Generate 3 to 5 sub-queries that together cover the research question completely."
+        )
+
     if use_cache_control:
-        # Anthropic prompt caching: static instructions cached, dynamic query not.
-        # The template is sent as-is (with {{user_query}} placeholder visible);
-        # the actual query follows in the next uncached block.
+        # Anthropic prompt caching: static template (with mode instruction) is cached;
+        # the per-request user_query goes in a separate uncached block.
+        static_text = prompt_template.replace(
+            "{{num_queries_instruction}}", num_queries_instruction
+        )
         content_blocks: list[dict[str, object]] = [
             {
                 "type": "text",
-                "text": prompt_template,
+                "text": static_text,
                 "cache_control": {"type": "ephemeral"},
             },
             {
@@ -160,7 +176,12 @@ def _build_messages(
             },
         ]
         return [SystemMessage(content=content_blocks)]  # type: ignore[arg-type]
-    filled = prompt_template.replace("{{user_query}}", user_query)
+
+    filled = (
+        prompt_template
+        .replace("{{num_queries_instruction}}", num_queries_instruction)
+        .replace("{{user_query}}", user_query)
+    )
     return [SystemMessage(content=filled)]
 
 
@@ -169,24 +190,34 @@ def _build_messages(
 # ---------------------------------------------------------------------------
 
 
-def _validate_output(output: SupervisorOutput) -> None:
+def _validate_output(output: SupervisorOutput, research_mode: str = "research") -> None:
     """Validate parsed supervisor output for structural correctness.
 
     Checks:
-    - 3 <= len(sub_queries) <= 5
+    - fast mode: exactly 3 sub-queries
+    - research mode: 3 <= len(sub_queries) <= 5
     - All source_type values are valid SourceType literals
     - No duplicate query strings
     - No empty query strings
 
     Args:
         output: The parsed SupervisorOutput to validate.
+        research_mode: "fast" or "research" — controls query count rule.
 
     Raises:
         AgentParseError: If any validation rule is violated.
     """
     count = len(output.sub_queries)
-    if count < 3 or count > 5:
-        raise AgentParseError(f"Supervisor returned {count} sub-queries; expected 3–5.")
+    if research_mode == "fast":
+        if count != 3:
+            raise AgentParseError(
+                f"Fast mode requires exactly 3 sub-queries; got {count}."
+            )
+    else:
+        if count < 3 or count > 5:
+            raise AgentParseError(
+                f"Supervisor returned {count} sub-queries; expected 3–5."
+            )
 
     queries: list[str] = []
     for sq in output.sub_queries:
@@ -221,6 +252,7 @@ def _validate_output(output: SupervisorOutput) -> None:
 async def _call_llm(
     user_query: str,
     llm: BaseChatModel,
+    research_mode: str = "research",
 ) -> SupervisorOutput:
     """Call the LLM and parse the response into a typed SupervisorOutput.
 
@@ -245,7 +277,7 @@ async def _call_llm(
         AgentParseError: After 3 failed parse/validation attempts.
     """
     prompt_template = _load_prompt()
-    messages = _build_messages(user_query, prompt_template, _is_anthropic(llm))
+    messages = _build_messages(user_query, prompt_template, _is_anthropic(llm), research_mode)
 
     response = await llm.ainvoke(messages)
     raw: str = str(response.content)
@@ -271,7 +303,7 @@ async def _call_llm(
         intent_type=raw_output["intent_type"],  # type: ignore[arg-type]
         sub_queries=sub_queries,
     )
-    _validate_output(output)
+    _validate_output(output, research_mode)
     return output
 
 
@@ -313,8 +345,9 @@ async def supervisor_node(
     if not user_query:
         raise ValueError("state['user_query'] must not be empty.")
 
+    research_mode: str = str(state.get("research_mode", "research"))
     supervisor_start(user_query)
-    output = await _call_llm(user_query, runtime.context.llm_supervisor)
+    output = await _call_llm(user_query, runtime.context.llm_supervisor, research_mode)
     sub_queries = [sq.query for sq in output.sub_queries]
     supervisor_done(str(output.intent_type), sub_queries)
 

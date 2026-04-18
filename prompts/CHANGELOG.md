@@ -50,6 +50,14 @@
 
 ---
 
+## supervisor_v2.txt
+- **Date**: 2026-04-16
+- **What**: Replaced hardcoded "Generate 3-5 sub-queries" with `{{num_queries_instruction}}` placeholder. Fast mode injects "EXACTLY 3 — no more, no less"; research mode injects "3 to 5". `_build_messages` now accepts `research_mode` and fills the placeholder before the LLM call.
+- **Why**: LLM ignored the Python-side count validation and returned 5 sub-queries in fast mode, causing every fast-mode request to fail with AgentParseError. The constraint must be in the prompt, not just in post-LLM validation.
+- **Eval delta**: TBD
+
+---
+
 ## Template for new entries
 
 ```
