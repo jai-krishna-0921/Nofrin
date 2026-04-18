@@ -1,0 +1,30 @@
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  background: #0A0907;
+  color: #EDE9DF;
+  font-family: 'Syne', system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#app { min-height: 100vh; }
+
+/* Scrollbars */
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #2C2A24; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #3C3A34; }
+
+/* Selection */
+::selection {
+  background: rgba(212, 168, 67, 0.22);
+  color: #EDE9DF;
+}
