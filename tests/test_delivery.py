@@ -5,14 +5,17 @@ Unit tests for agents/delivery.py.
 
 Tests markdown rendering, force-delivery caveat injection, quality badge
 formatting, section inclusion/omission logic, citation formatting, and
-NotImplementedError for unimplemented formats.
+binary format data URI encoding.
 """
 
 from __future__ import annotations
 
+import base64
 import pytest
+from unittest.mock import AsyncMock, patch
 
 from agents.delivery import delivery_node, render_markdown
+from agents.sandbox_runner import SandboxExecutionError
 from graph.state import (
     CriticOutput,
     Evidence,
@@ -333,27 +336,30 @@ async def test_output_format_markdown_produces_output() -> None:
 
 
 @pytest.mark.asyncio
-async def test_output_format_docx_raises_not_implemented() -> None:
-    """Test #18: NotImplementedError raised for docx format."""
+async def test_output_format_docx_produces_data_uri() -> None:
+    """Test #18: docx format produces data URI output."""
     state = build_state(synthesis=build_synthesis(), output_format="docx")
-    with pytest.raises(NotImplementedError, match="DOCX"):
-        await delivery_node(state)
+    with patch("agents.delivery.execute_in_sandbox", new=AsyncMock(return_value=b"fake-docx-bytes")):
+        result = await delivery_node(state)
+        assert result["final_output"].startswith("data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,")
 
 
 @pytest.mark.asyncio
-async def test_output_format_pdf_raises_not_implemented() -> None:
-    """Test #19: NotImplementedError raised for pdf format."""
+async def test_output_format_pdf_produces_data_uri() -> None:
+    """Test #19: pdf format produces data URI output."""
     state = build_state(synthesis=build_synthesis(), output_format="pdf")
-    with pytest.raises(NotImplementedError, match="PDF"):
-        await delivery_node(state)
+    with patch("agents.delivery.execute_in_sandbox", new=AsyncMock(return_value=b"fake-pdf-bytes")):
+        result = await delivery_node(state)
+        assert result["final_output"].startswith("data:application/pdf;base64,")
 
 
 @pytest.mark.asyncio
-async def test_output_format_pptx_raises_not_implemented() -> None:
-    """Test #20: NotImplementedError raised for pptx format."""
+async def test_output_format_pptx_produces_data_uri() -> None:
+    """Test #20: pptx format produces data URI output."""
     state = build_state(synthesis=build_synthesis(), output_format="pptx")
-    with pytest.raises(NotImplementedError, match="PPTX"):
-        await delivery_node(state)
+    with patch("agents.delivery.execute_in_sandbox", new=AsyncMock(return_value=b"fake-pptx-bytes")):
+        result = await delivery_node(state)
+        assert result["final_output"].startswith("data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,")
 
 
 @pytest.mark.asyncio
@@ -402,3 +408,61 @@ async def test_empty_gaps_omits_section() -> None:
     state = build_state(synthesis=synthesis)
     result = await delivery_node(state)
     assert "## Known Gaps" not in result["final_output"]
+
+
+@pytest.mark.asyncio
+async def test_render_docx_returns_data_uri() -> None:
+    """Test #25: DOCX rendering returns valid data URI with correct MIME type."""
+    state = build_state(synthesis=build_synthesis(), output_format="docx")
+    with patch("agents.delivery.execute_in_sandbox", new=AsyncMock(return_value=b"fake-docx")):
+        result = await delivery_node(state)
+        assert result["final_output"].startswith(
+            "data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,"
+        )
+
+
+@pytest.mark.asyncio
+async def test_render_docx_base64_decodable() -> None:
+    """Test #26: DOCX data URI contains valid base64-encoded content."""
+    state = build_state(synthesis=build_synthesis(), output_format="docx")
+    fake_bytes = b"fake-docx-content"
+    with patch("agents.delivery.execute_in_sandbox", new=AsyncMock(return_value=fake_bytes)):
+        result = await delivery_node(state)
+        data_uri = result["final_output"]
+        # Split on comma: "data:MIME;base64,ENCODED"
+        encoded_part = data_uri.split(",", 1)[1]
+        # Should decode without error
+        decoded = base64.b64decode(encoded_part)
+        assert decoded == fake_bytes
+
+
+@pytest.mark.asyncio
+async def test_render_pdf_returns_data_uri() -> None:
+    """Test #27: PDF rendering returns valid data URI with correct MIME type."""
+    state = build_state(synthesis=build_synthesis(), output_format="pdf")
+    with patch("agents.delivery.execute_in_sandbox", new=AsyncMock(return_value=b"fake-pdf")):
+        result = await delivery_node(state)
+        assert result["final_output"].startswith("data:application/pdf;base64,")
+
+
+@pytest.mark.asyncio
+async def test_render_pptx_returns_data_uri() -> None:
+    """Test #28: PPTX rendering returns valid data URI with correct MIME type."""
+    state = build_state(synthesis=build_synthesis(), output_format="pptx")
+    with patch("agents.delivery.execute_in_sandbox", new=AsyncMock(return_value=b"fake-pptx")):
+        result = await delivery_node(state)
+        assert result["final_output"].startswith(
+            "data:application/vnd.openxmlformats-officedocument.presentationml.presentation;base64,"
+        )
+
+
+@pytest.mark.asyncio
+async def test_render_docx_sandbox_error_propagates() -> None:
+    """Test #29: SandboxExecutionError from execute_in_sandbox propagates to caller."""
+    state = build_state(synthesis=build_synthesis(), output_format="docx")
+    with patch(
+        "agents.delivery.execute_in_sandbox",
+        new=AsyncMock(side_effect=SandboxExecutionError("boom")),
+    ):
+        with pytest.raises(SandboxExecutionError, match="boom"):
+            await delivery_node(state)

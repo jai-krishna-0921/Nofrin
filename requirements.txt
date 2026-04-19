@@ -39,3 +39,6 @@ python-multipart>=0.0.6
 pytest==9.0.2
 mypy==1.19.1
 ruff==0.15.7
+
+# Sandbox execution (document rendering)
+microsandbox>=0.3.14
