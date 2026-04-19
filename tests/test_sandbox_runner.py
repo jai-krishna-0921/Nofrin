@@ -184,17 +184,23 @@ async def test_cleanup_called_on_failure(mock_env: None) -> None:
 
 
 @pytest.mark.asyncio
-async def test_missing_env_vars_raises_valueerror(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Test #7: missing MSB_SERVER_URL raises ValueError before Sandbox.create."""
+async def test_sandbox_create_called_regardless_of_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Test #7: MSB_SERVER_URL/MSB_API_KEY are optional — SDK reads them itself.
+
+    The SDK works in local mode without server env vars; Sandbox.create is
+    always attempted (not gated by our code).
+    """
     monkeypatch.delenv("MSB_SERVER_URL", raising=False)
     monkeypatch.delenv("MSB_API_KEY", raising=False)
+    mock_sb = make_mock_sandbox()
 
     with patch("agents.sandbox_runner.Sandbox") as MockSandbox:
-        MockSandbox.create = AsyncMock()
-        with pytest.raises(ValueError, match="MSB_SERVER_URL"):
-            await execute_in_sandbox(code='print("test")', packages=[])
-        # ValueError must fire before Sandbox.create is ever called
-        MockSandbox.create.assert_not_called()
+        MockSandbox.create = AsyncMock(return_value=mock_sb)
+        result = await execute_in_sandbox(code="pass", packages=[])
+        MockSandbox.create.assert_called_once()
+        assert result == b"fake-bytes"
 
 
 @pytest.mark.asyncio

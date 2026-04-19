@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import uuid
 from typing import Final
 
 from microsandbox import Network, Sandbox
@@ -70,19 +71,14 @@ async def execute_in_sandbox(code: str, packages: list[str]) -> bytes:
         SandboxExecutionError: On non-zero exit, timeout, or missing output file.
         MicrosandboxError: On infra failure after 3 retries (re-raised by tenacity).
     """
-    if not os.environ.get("MSB_SERVER_URL"):
-        raise ValueError("MSB_SERVER_URL environment variable is not set.")
-    if not os.environ.get("MSB_API_KEY"):
-        raise ValueError("MSB_API_KEY environment variable is not set.")
-
     sb: Sandbox | None = None
     try:
         sb = await Sandbox.create(
-            "docgen",
+            f"docgen-{uuid.uuid4().hex[:8]}",
             image=_SANDBOX_IMAGE,
             cpus=_SANDBOX_CPUS,
             memory=_SANDBOX_MEMORY_MB,
-            network=Network.none(),  # airgap: no outbound or inbound connections
+            network=Network.public_only(),  # outbound only — needed for pip; blocks inbound
         )
 
         if packages:
