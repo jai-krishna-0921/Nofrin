@@ -142,6 +142,16 @@ function downloadMarkdown() {
   a.click()
   URL.revokeObjectURL(url)
 }
+
+function downloadBinary() {
+  if (!result.value?.startsWith('data:')) return
+  const ext = { docx: 'docx', pdf: 'pdf', pptx: 'pptx' }[format.value] ?? format.value
+  const a = Object.assign(document.createElement('a'), {
+    href: result.value,
+    download: `research-brief.${ext}`,
+  })
+  a.click()
+}
 </script>
 
 <template>
@@ -354,6 +364,13 @@ function downloadMarkdown() {
                     @click="downloadMarkdown"
                   >
                     ↓ SAVE .MD
+                  </button>
+                  <button
+                    class="action-btn"
+                    v-if="format !== 'markdown' && result?.startsWith('data:')"
+                    @click="downloadBinary"
+                  >
+                    ↓ SAVE .{{ format.toUpperCase() }}
                   </button>
                 </div>
               </div>
