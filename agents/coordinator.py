@@ -16,6 +16,7 @@ Writes: state["synthesis"], state["prior_syntheses"] (PATH 2 only),
 from __future__ import annotations
 
 import logging
+from datetime import date
 from pathlib import Path
 from typing import TypedDict
 
@@ -42,16 +43,16 @@ from graph.state import (
 )
 from graph.utils import AgentParseError, parse_agent_json
 
-FIRST_PASS_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "coordinator_v1.txt"
+FIRST_PASS_PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "coordinator_v3.txt"
 REVISION_PROMPT_PATH = (
-    Path(__file__).parent.parent / "prompts" / "coordinator_revision_v2.txt"
+    Path(__file__).parent.parent / "prompts" / "coordinator_revision_v4.txt"
 )
 
 logger = logging.getLogger(__name__)
 
 # Total character cap across all serialized evidence items.
 # Each item is either fully included or fully excluded (no mid-item truncation).
-_EVIDENCE_CHAR_CAP = 6000
+_EVIDENCE_CHAR_CAP = 12000
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +213,7 @@ def _build_first_pass_messages(
     evidence_block: str,
     prompt_template: str,
     use_cache_control: bool = False,
+    current_date: str = "",
 ) -> list[BaseMessage]:
     """Build messages for PATH 1 (first-pass synthesis).
 
@@ -232,7 +234,7 @@ def _build_first_pass_messages(
         content_blocks: list[dict[str, object]] = [
             {
                 "type": "text",
-                "text": prompt_template,
+                "text": prompt_template.replace("{{current_date}}", current_date),
                 "cache_control": {"type": "ephemeral"},
             },
             {
@@ -241,7 +243,11 @@ def _build_first_pass_messages(
             },
         ]
         return [SystemMessage(content=content_blocks)]  # type: ignore[arg-type]
-    filled = prompt_template.replace("{{evidence_block}}", evidence_block)
+    filled = (
+        prompt_template
+        .replace("{{current_date}}", current_date)
+        .replace("{{evidence_block}}", evidence_block)
+    )
     return [SystemMessage(content=filled)]
 
 
@@ -252,6 +258,7 @@ def _build_revision_messages(
     revision_count: int,
     prompt_template: str,
     use_cache_control: bool = False,
+    current_date: str = "",
 ) -> list[BaseMessage]:
     """Build messages for PATH 2 (revision pass).
 
@@ -281,8 +288,10 @@ def _build_revision_messages(
         content_blocks: list[dict[str, object]] = [
             {
                 "type": "text",
-                "text": prompt_template.replace(
-                    "{{revision_count}}", str(revision_count)
+                "text": (
+                    prompt_template
+                    .replace("{{revision_count}}", str(revision_count))
+                    .replace("{{current_date}}", current_date)
                 ),
                 "cache_control": {"type": "ephemeral"},
             },
@@ -293,7 +302,9 @@ def _build_revision_messages(
         ]
         return [SystemMessage(content=content_blocks)]  # type: ignore[arg-type]
     filled = (
-        prompt_template.replace("{{evidence_block}}", evidence_block)
+        prompt_template
+        .replace("{{current_date}}", current_date)
+        .replace("{{evidence_block}}", evidence_block)
         .replace("{{prior_synthesis_block}}", prior_synthesis_block)
         .replace("{{critic_issues_block}}", critic_issues_block)
         .replace("{{revision_count}}", str(revision_count))
@@ -533,6 +544,7 @@ async def coordinator_node(
 
     evidence_block = _serialize_evidence(worker_results)
     use_cache = _is_anthropic(llm)
+    current_date = date.today().isoformat()
 
     coordinator_start(revision_count, len(worker_results))
 
@@ -540,7 +552,7 @@ async def coordinator_node(
         # ── PATH 1: first-pass synthesis ─────────────────────────────────────
         prompt_template = _load_prompt(FIRST_PASS_PROMPT_PATH)
         messages = _build_first_pass_messages(
-            evidence_block, prompt_template, use_cache
+            evidence_block, prompt_template, use_cache, current_date
         )
         synthesis, tokens = await _call_llm(
             messages,
@@ -599,6 +611,7 @@ async def coordinator_node(
         revision_count,
         prompt_template,
         use_cache,
+        current_date,
     )
 
     synthesis, tokens = await _call_llm(

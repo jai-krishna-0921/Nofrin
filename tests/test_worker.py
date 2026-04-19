@@ -128,6 +128,8 @@ def mock_runtime() -> MagicMock:
     runtime.context.llm_worker = mock_llm
     runtime.context.tavily_client = None
     runtime.context.brave_api_key = None
+    runtime.context.google_api_key = None
+    runtime.context.google_cse_id = None
 
     return runtime
 
@@ -149,6 +151,8 @@ def mock_runtime_no_results() -> MagicMock:
     runtime.context.llm_worker = mock_llm
     runtime.context.tavily_client = None
     runtime.context.brave_api_key = None
+    runtime.context.google_api_key = None
+    runtime.context.google_cse_id = None
 
     return runtime
 
@@ -194,12 +198,14 @@ async def test_worker_node_returns_correct_source_type(
 async def test_worker_node_web_no_date_filter(
     mock_runtime_no_results: MagicMock,
 ) -> None:
-    """Web source_type: search_and_contents called without start_published_date."""
+    """Web source_type: search_and_contents called with start_published_date = today-365d."""
     await worker_node(make_worker_state("web"), mock_runtime_no_results)
     call_kwargs = (
         mock_runtime_no_results.context.exa_client.search_and_contents.call_args[1]
     )
-    assert "start_published_date" not in call_kwargs
+    from datetime import date, timedelta
+    expected = (date.today() - timedelta(days=365)).isoformat()
+    assert call_kwargs["start_published_date"] == expected
 
 
 @pytest.mark.asyncio
@@ -430,10 +436,12 @@ async def test_published_date_from_exa_not_llm(mock_runtime: MagicMock) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_build_exa_params_web_no_date_filter() -> None:
-    """Web params do not include start_published_date."""
+def test_build_exa_params_web_has_date_filter() -> None:
+    """Web params include start_published_date = today - 365 days."""
+    from datetime import date, timedelta
     params = _build_exa_params_web("query")
-    assert "start_published_date" not in params
+    expected = (date.today() - timedelta(days=365)).isoformat()
+    assert params["start_published_date"] == expected
 
 
 def test_build_exa_params_academic_has_category() -> None:

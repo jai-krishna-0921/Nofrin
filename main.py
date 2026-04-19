@@ -89,6 +89,8 @@ def _build_context(session_id: str) -> NofrinContext:
     cost_ceiling = float(os.getenv("COST_CEILING_USD", "1.00"))
     tavily_key = os.environ.get("TAVILY_API_KEY", "")
     brave_key = os.environ.get("BRAVE_API_KEY", "") or None
+    google_api_key = os.environ.get("GOOGLE_API_KEY", "") or None
+    google_cse_id = os.environ.get("GOOGLE_CSE_ID", "") or None
 
     tavily_client = None
     if tavily_key:
@@ -109,6 +111,8 @@ def _build_context(session_id: str) -> NofrinContext:
         cost_ceiling_usd=cost_ceiling,
         tavily_client=tavily_client,
         brave_api_key=brave_key,
+        google_api_key=google_api_key,
+        google_cse_id=google_cse_id,
     )
 
 

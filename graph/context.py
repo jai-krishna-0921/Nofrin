@@ -69,6 +69,8 @@ class NofrinContext:
     cost_ceiling_usd: float = field(default=1.00)
     tavily_client: AsyncTavilyClient | None = None
     brave_api_key: str | None = None
+    google_api_key: str | None = None
+    google_cse_id: str | None = None
 
 
 __all__ = ["NofrinContext"]

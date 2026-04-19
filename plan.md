@@ -1,371 +1,441 @@
-# Deep Research Agent — FastAPI Web UI Plan
+# Microsandbox Integration Plan
 
 ## Problem Statement
 
-The pipeline only has a CLI interface (`main.py`). Adding a web UI enables browser-based research queries with real-time progress streaming, allowing users to submit queries, observe live status updates as each pipeline node executes, and receive the final research brief rendered as HTML. Target pipeline runtime is 30–90 seconds, making real-time progress feedback essential for UX.
+The Deep Research Agent's delivery node currently raises `NotImplementedError` for DOCX, PDF, and PPTX output formats. These formats require document generation libraries (python-docx, python-pptx, WeasyPrint) that have heavy native dependencies and potential security concerns when running user-influenced code. Microsandbox provides isolated container execution to safely render these document formats without polluting the host environment or exposing the main process to dependency conflicts.
 
----
-
-## Architecture Decision: SSE Streaming
-
-**SSE over WebSockets and polling.** The pipeline is fire-and-observe: the client submits a query via POST then receives a unidirectional event stream, which exactly matches SSE semantics. Unlike WebSockets, SSE requires no bidirectional communication, uses standard HTTP, works through proxies without special configuration, and auto-reconnects natively in browsers. Polling would require clients to hit a status endpoint every 1–2 seconds for 30–90 seconds — wasteful and slow to surface progress. SSE delivers events instantly as they occur. `sse-starlette` provides a production-ready implementation that integrates cleanly with FastAPI's async architecture and the project's all-async requirement (CLAUDE.md).
-
----
-
-## File Structure
-
-```
-api/
-  __init__.py          # Package marker
-  server.py            # FastAPI app + endpoints
-  session_store.py     # In-memory SessionState dict
-  pipeline.py          # run_pipeline() coroutine
-static/
-  index.html           # Single-file frontend (no npm, no build step)
-tests/
-  test_api.py          # 15 new tests (added to existing tests/ dir)
-```
-
----
-
-## Session State Design
+## API Facts (verified from v0.3.14 type stubs)
 
 ```python
-# api/session_store.py
+# Exact signatures from _microsandbox.pyi:
+async def Sandbox.create(name_or_config: str | dict, **kwargs) -> Sandbox
+#   kwargs accepted: image, cpus, memory, network, ...
+#   MSB_SERVER_URL and MSB_API_KEY are read from env AUTOMATICALLY — no kwargs needed.
+
+async def sb.exec(cmd: str, args_or_options: list[str] | ExecOptions | None = None) -> ExecOutput
+#   ExecOptions(args, cwd, user, env, timeout, stdin, tty, rlimits) — native timeout support.
+
+# ExecOutput properties: .exit_code, .success, .stdout_text, .stderr_text, .stdout_bytes, .stderr_bytes
+
+sb.fs  # -> SandboxFs (property, not async)
+async def SandboxFs.read(path: str) -> bytes       # ✓ returns bytes
+async def SandboxFs.read_text(path: str) -> str
+async def SandboxFs.write(path: str, data: bytes) -> None
+
+async def sb.stop_and_wait() -> tuple[int, bool]
+
+Network.none() -> Network   # airgap — no outbound or inbound connections
+
+# Real exceptions from microsandbox.errors:
+ExecTimeoutError   # raised when ExecOptions.timeout exceeded
+ExecFailedError    # raised on exec failure (depends on config)
+MicrosandboxError  # base class
+```
+
+## Approach: Base64-encoded binary output stored in `final_output: str`
+
+`ResearchAgentState.final_output` is typed as `Optional[str]`. Rather than changing the state schema (which would require updates across the entire pipeline), binary document bytes will be base64-encoded with a MIME-type prefix:
+
+```
+data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,UEsDB...
+```
+
+**Why this approach:**
+1. No schema changes — avoids cascading TypedDict updates across graph/state.py, tests, all consumers
+2. Self-describing — MIME prefix allows downstream code to detect format and decode
+3. Reversible — trivial to decode: split on comma, base64.b64decode the second part
+
+**Alternatives considered:**
+
+| Alternative | Reason rejected |
+|-------------|-----------------|
+| Change `final_output` to `bytes \| str` | Breaks TypedDict contract; requires updates in router, API, tests |
+| Write to temp file, store path | File lifecycle complexity; path may be invalid by consumption time |
+| Separate `final_output_bytes: Optional[bytes]` field | Schema churn; unclear which field to read |
+
+## Files
+
+### New Files
+
+| Path | Purpose |
+|------|---------|
+| `agents/sandbox_runner.py` | Sandbox execution wrapper with `SandboxExecutionError` and `execute_in_sandbox()` |
+| `tests/test_sandbox_runner.py` | Unit tests for sandbox_runner with mocked Sandbox |
+
+### Modified Files
+
+| Path | Changes |
+|------|---------|
+| `agents/delivery.py` | Replace stub `_render_docx`, `_render_pdf`, `_render_pptx` with async sandbox-based implementations |
+| `tests/test_delivery.py` | Add tests for binary format rendering (mocked sandbox); update 3 existing NotImplementedError tests |
+| `requirements.txt` | Add `microsandbox>=0.3.14`, `tenacity>=8.2` |
+
+### Environment Variables (add to `.env` and `.env.example`)
+
+```bash
+# Microsandbox — read automatically by microsandbox SDK (no kwargs needed)
+MSB_SERVER_URL=http://localhost:5555
+MSB_API_KEY=your-api-key-here
+```
+
+---
+
+## Code Snippets
+
+### 1. `agents/sandbox_runner.py` — Full API Shape
+
+```python
+"""
+agents/sandbox_runner.py
+
+Isolated sandbox execution for document rendering.
+MSB_SERVER_URL and MSB_API_KEY are read from env by microsandbox SDK automatically.
+"""
 from __future__ import annotations
 
-import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Literal
+import os
+from typing import Final
 
-SessionStatus = Literal["pending", "running", "done", "error"]
+from microsandbox import Network, Sandbox
+from microsandbox.errors import ExecTimeoutError, MicrosandboxError
+from microsandbox.types import ExecOptions
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+_OUTPUT_PATH: Final[str] = "/tmp/out"
+_SANDBOX_IMAGE: Final[str] = "python"
+_SANDBOX_CPUS: Final[int] = 1
+_SANDBOX_MEMORY_MB: Final[int] = 512
+_PACKAGE_INSTALL_TIMEOUT_SECS: Final[float] = 120.0
+_CODE_EXECUTION_TIMEOUT_SECS: Final[float] = 60.0
 
 
-@dataclass
-class SessionState:
-    """State for a single research session.
+class SandboxExecutionError(Exception):
+    """Raised when sandbox code execution fails or the sandbox is unreachable."""
 
-    Attributes:
-        session_id:   Unique identifier for this session.
-        status:       Current lifecycle status.
-        events:       Buffered SSE payloads for late-joining clients.
-        final_output: Rendered markdown output when done.
-        cost_usd:     Total LLM cost for this session.
-        tokens_used:  Total tokens consumed.
-        error:        Error message if status == "error".
-        created_at:   Session creation timestamp (UTC).
+    def __init__(
+        self,
+        message: str,
+        exit_code: int | None = None,
+        stderr: str = "",
+        cause: Exception | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+        self.stderr = stderr
+        self.cause = cause
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """Return True for errors worth retrying (connection, infra), False for logic errors."""
+    # SandboxExecutionError wrapping a non-zero exit is a code/logic error — don't retry.
+    if isinstance(exc, SandboxExecutionError) and exc.exit_code is not None:
+        return False
+    # MicrosandboxError without an exit_code is infra (server unreachable, OOM, etc.)
+    return isinstance(exc, (MicrosandboxError, OSError, ConnectionError))
+
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=1, max=10),
+    retry=retry_if_exception_type((MicrosandboxError, OSError, ConnectionError)),
+    reraise=True,
+)
+async def execute_in_sandbox(code: str, packages: list[str]) -> bytes:
+    """Execute Python code in an isolated, airgapped microsandbox container.
+
+    MSB_SERVER_URL and MSB_API_KEY must be set in the environment; the
+    microsandbox SDK reads them automatically — no kwargs required.
+
+    The code MUST write its output to /tmp/out as raw bytes.
+
+    Args:
+        code: Python code string. Must write output to /tmp/out.
+        packages: pip packages to install before execution.
+
+    Returns:
+        Raw bytes read from /tmp/out inside the sandbox.
+
+    Raises:
+        SandboxExecutionError: On non-zero exit, timeout, or missing output.
+        MicrosandboxError: On infra failure after 3 retries (re-raised by tenacity).
     """
-
-    session_id: str
-    status: SessionStatus = "pending"
-    events: list[str] = field(default_factory=list)
-    final_output: str | None = None
-    cost_usd: float = 0.0
-    tokens_used: int = 0
-    error: str | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-
-
-class SessionStore:
-    """Thread-safe in-memory session storage with TTL cleanup."""
-
-    TTL_SECONDS: int = 3600  # 1 hour
-
-    def __init__(self) -> None:
-        self._sessions: dict[str, SessionState] = {}
-        self._lock: threading.Lock = threading.Lock()
-
-    def create(self, session_id: str) -> SessionState:
-        session = SessionState(session_id=session_id)
-        with self._lock:
-            self._sessions[session_id] = session
-        return session
-
-    def get(self, session_id: str) -> SessionState | None:
-        with self._lock:
-            return self._sessions.get(session_id)
-
-    def set(self, session: SessionState) -> None:
-        with self._lock:
-            self._sessions[session.session_id] = session
-
-    def list_expired(self, max_age_seconds: int | None = None) -> list[str]:
-        max_age = max_age_seconds if max_age_seconds is not None else self.TTL_SECONDS
-        cutoff = datetime.utcnow() - timedelta(seconds=max_age)
-        with self._lock:
-            return [sid for sid, s in self._sessions.items() if s.created_at < cutoff]
-
-    def cleanup_expired(self, max_age_seconds: int | None = None) -> int:
-        expired = self.list_expired(max_age_seconds)
-        with self._lock:
-            for sid in expired:
-                self._sessions.pop(sid, None)
-        return len(expired)
-
-
-store = SessionStore()  # module-level singleton
-```
-
----
-
-## API Endpoints
-
-| Method | Path | Request Body | Response | Purpose |
-|--------|------|--------------|----------|---------|
-| `POST` | `/research` | `{"query": str, "mode": "fast"\|"research", "format": "markdown"}` | `{"session_id": str}` | Start pipeline in background task |
-| `GET` | `/stream/{session_id}` | — | SSE event stream | Real-time pipeline events |
-| `GET` | `/status/{session_id}` | — | `{"session_id", "status", "cost_usd", "tokens_used", "error"}` | Poll-friendly JSON snapshot |
-| `GET` | `/` | — | `text/html` | Serve `static/index.html` |
-
----
-
-## SSE Event Protocol
-
-Four event types, emitted in order:
-
-### 1. `event: status`
-One per pipeline phase, sent when a node starts or completes.
-```
-event: status
-data: {"phase": "supervisor", "message": "Classifying intent and decomposing query..."}
-```
-Phases: `supervisor`, `worker`, `coordinator`, `grounding_check`, `critic`, `delivery`
-
-### 2. `event: result`
-Emitted once on successful completion.
-```
-event: result
-data: {"final_output": "# Research Brief\n\n...", "cost_usd": 0.05, "tokens": 1200}
-```
-
-### 3. `event: error`
-Emitted on pipeline failure.
-```
-event: error
-data: {"message": "Cost ceiling exceeded: $1.02 > $1.00"}
-```
-
-### 4. `event: done`
-Always the final event — signals stream closure.
-```
-event: done
-data: 
-```
-
----
-
-## Graph Integration
-
-`api/pipeline.py` reuses `_build_context()` and `_build_initial_state()` from `main.py` and calls `build_graph()` unchanged. An `emit` callback is injected so `graph/progress.py` can push SSE events without knowing about FastAPI.
-
-### `run_pipeline()` Signature
-
-```python
-# api/pipeline.py
-async def run_pipeline(
-    session_id: str,
-    query: str,
-    output_format: OutputFormat,
-    research_mode: ResearchMode,
-    emit: Callable[[str, str], None],  # emit(event_type, json_payload)
-) -> None:
-    """Execute the research pipeline and emit SSE events via the emit callback."""
-```
-
-### Progress Event Hooking
-
-Add to `graph/progress.py`:
-
-```python
-_SSE_CALLBACK: Callable[[str, str], None] | None = None
-
-def set_sse_callback(callback: Callable[[str, str], None] | None) -> None:
-    """Register (or clear) the SSE progress callback."""
-    global _SSE_CALLBACK
-    _SSE_CALLBACK = callback
-
-def _emit_sse(phase: str, message: str) -> None:
-    """Forward a progress event to the registered SSE callback, if any."""
-    if _SSE_CALLBACK is not None:
-        import json
-        _SSE_CALLBACK("status", json.dumps({"phase": phase, "message": message}))
-```
-
-Each existing `*_start()` and `*_done()` function calls `_emit_sse(node, message)` alongside the existing `_emit()` call. `run_pipeline()` calls `set_sse_callback(emit)` at start and `set_sse_callback(None)` in the `finally` block.
-
-### `POST /research` Background Task
-
-```python
-@app.post("/research", response_model=ResearchResponse)
-async def start_research(
-    request: ResearchRequest,
-    background_tasks: BackgroundTasks,
-) -> ResearchResponse:
-    session_id = str(uuid.uuid4())
-    store.create(session_id)
-
-    def emit(event_type: str, data: str) -> None:
-        session = store.get(session_id)
-        if session is None:
-            return
-        session.events.append(f"{event_type}:{data}")
-        if event_type == "error":
-            session.status = "error"
-            session.error = json.loads(data).get("message") if data else None
-        elif event_type == "result":
-            parsed = json.loads(data)
-            session.final_output = parsed.get("final_output")
-            session.cost_usd = parsed.get("cost_usd", 0.0)
-            session.tokens_used = parsed.get("tokens", 0)
-        elif event_type == "done" and session.status != "error":
-            session.status = "done"
-        store.set(session)
-
-    async def run_task() -> None:
-        session = store.get(session_id)
-        if session is not None:
-            session.status = "running"
-            store.set(session)
-        await run_pipeline(
-            session_id=session_id,
-            query=request.query,
-            output_format=request.format,
-            research_mode=request.mode,
-            emit=emit,
+    sb: Sandbox | None = None
+    try:
+        sb = await Sandbox.create(
+            "docgen",
+            image=_SANDBOX_IMAGE,
+            cpus=_SANDBOX_CPUS,
+            memory=_SANDBOX_MEMORY_MB,
+            network=Network.none(),   # airgap: no outbound or inbound connections
         )
 
-    background_tasks.add_task(run_task)
-    return ResearchResponse(session_id=session_id)
+        if packages:
+            pip_opts = ExecOptions(
+                args=["install", "--quiet"] + packages,
+                timeout=_PACKAGE_INSTALL_TIMEOUT_SECS,
+            )
+            pip_result = await sb.exec("pip", pip_opts)
+            if pip_result.exit_code != 0:
+                raise SandboxExecutionError(
+                    f"Package installation failed: {packages}",
+                    exit_code=pip_result.exit_code,
+                    stderr=pip_result.stderr_text,
+                )
+
+        exec_opts = ExecOptions(
+            args=["-c", code],
+            timeout=_CODE_EXECUTION_TIMEOUT_SECS,
+        )
+        exec_result = await sb.exec("python", exec_opts)
+        if exec_result.exit_code != 0:
+            raise SandboxExecutionError(
+                "Code execution failed",
+                exit_code=exec_result.exit_code,
+                stderr=exec_result.stderr_text,
+            )
+
+        try:
+            output_bytes: bytes = await sb.fs.read(_OUTPUT_PATH)
+        except Exception as e:
+            raise SandboxExecutionError(
+                f"Output file not found at {_OUTPUT_PATH}. "
+                "Ensure code writes to this path.",
+                cause=e,
+            ) from e
+
+        return output_bytes
+
+    except SandboxExecutionError:
+        raise
+    except ExecTimeoutError as e:
+        raise SandboxExecutionError(
+            "Sandbox execution timed out.", cause=e
+        ) from e
+    except MicrosandboxError:
+        raise  # let tenacity retry on infra errors
+    except Exception as e:
+        raise SandboxExecutionError(
+            f"Sandbox execution failed: {e}", cause=e
+        ) from e
+    finally:
+        if sb is not None:
+            await sb.stop_and_wait()
+
+
+__all__ = ["SandboxExecutionError", "execute_in_sandbox"]
 ```
 
-### SSE Endpoint
+**Notes on retry strategy:**
+- Retries only on `MicrosandboxError`, `OSError`, `ConnectionError` (infra/transient)
+- Does NOT retry on `SandboxExecutionError` with `exit_code != None` (code logic failures)
+- Does NOT retry on `ExecTimeoutError` (60s timeout hit — not worth retrying)
+- Max 3 attempts, exponential backoff 1s → 10s
 
+### 2. `agents/delivery.py` — Changes
+
+**New imports:**
 ```python
-@app.get("/stream/{session_id}")
-async def stream_events(session_id: str) -> EventSourceResponse:
-    session = store.get(session_id)
-    if session is None:
-        raise HTTPException(status_code=404, detail="Session not found")
+import base64
+import json
 
-    async def event_generator() -> AsyncGenerator[dict[str, str], None]:
-        # Replay buffered events for late-joining clients
-        cursor = 0
-        while True:
-            current = store.get(session_id)
-            if current is None:
-                break
-            while cursor < len(current.events):
-                event_type, data = current.events[cursor].split(":", 1)
-                yield {"event": event_type, "data": data}
-                cursor += 1
-                if event_type == "done":
-                    return
-            if current.status in ("done", "error") and cursor >= len(current.events):
-                yield {"event": "done", "data": ""}
-                return
-            await asyncio.sleep(0.1)
+from agents.sandbox_runner import SandboxExecutionError, execute_in_sandbox
+```
 
-    return EventSourceResponse(event_generator())
+**New module-level constant (typed, no bare dict):**
+```python
+_MIME_TYPES: dict[str, str] = {
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "pdf": "application/pdf",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+}
+```
+
+**New pure helper:**
+```python
+def _encode_binary_output(data: bytes, format_key: str) -> str:
+    """Encode binary document bytes as a data URI string."""
+    mime = _MIME_TYPES[format_key]
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{encoded}"
+```
+
+**`_render_docx` shape (stubs become `async def`):**
+```python
+async def _render_docx(
+    synthesis: SynthesisOutput,
+    critic_output: CriticOutput | None,
+    is_force_delivered: bool,
+) -> str:
+    # repr(json.dumps(...)) embeds synthesis data as a Python string literal.
+    # json.dumps normalizes the data; repr() wraps it in quotes and escapes
+    # any characters that could break the outer f-string. Synthesis content
+    # originates from the coordinator LLM — not raw user input — but repr()
+    # ensures no synthesis text can escape the string boundary regardless.
+    doc_data_repr = repr(json.dumps({
+        "topic": synthesis.topic,
+        "executive_summary": synthesis.executive_summary,
+        "findings": [{"heading": f.heading, "body": f.body} for f in synthesis.findings],
+        "risks": synthesis.risks,
+        "gaps": synthesis.gaps,
+        "citations": [
+            {"title": c.source_title, "url": c.source_url}
+            for c in synthesis.citations
+        ],
+        "is_force_delivered": is_force_delivered,
+        "quality_score": critic_output.final_quality_score if critic_output else None,
+    }))
+    code = f"""
+import json
+from docx import Document
+data = json.loads({doc_data_repr})
+doc = Document()
+doc.add_heading(data["topic"], level=0)
+# ... full document build (headings, findings, risks, gaps, citations) ...
+doc.save("/tmp/out")
+"""
+    docx_bytes = await execute_in_sandbox(code=code, packages=["python-docx", "lxml"])
+    return _encode_binary_output(docx_bytes, "docx")
+```
+
+`_render_pdf` and `_render_pptx` follow the same pattern (WeasyPrint / python-pptx).
+
+**`delivery_node` — add `await` to three renderers (already `async def`, no signature change):**
+```python
+elif output_format == "docx":
+    final_output = await _render_docx(synthesis, critic_output, force_delivered)
+elif output_format == "pdf":
+    final_output = await _render_pdf(synthesis, critic_output, force_delivered)
+elif output_format == "pptx":
+    final_output = await _render_pptx(synthesis, critic_output, force_delivered)
 ```
 
 ---
 
-## Frontend UX
+## Tests
 
-Single `static/index.html` — no npm, no build step, no CDN build tools. Uses `marked.js` via CDN for markdown rendering.
+### `tests/test_sandbox_runner.py` (9 tests)
 
-**Layout:**
-1. **Form** — query textarea, fast/research radio buttons, Submit button (disabled during run)
-2. **Progress area** — live status events as a vertical timeline with timestamps and phase badges
-3. **Results area** — final output rendered HTML (hidden until `result` event received)
-4. **Stats bar** — `$cost`, token count, elapsed duration (shown on completion)
+| Test | What it covers |
+|------|---------------|
+| `test_success_returns_bytes` | Mock Sandbox; verify fs.read bytes returned |
+| `test_package_install_failure_raises` | pip exit_code=1 → SandboxExecutionError (no retry) |
+| `test_code_execution_failure_raises` | python exit_code=1 → SandboxExecutionError (no retry) |
+| `test_missing_output_file_raises` | fs.read raises → SandboxExecutionError "not found" |
+| `test_cleanup_called_on_success` | stop_and_wait() called after success |
+| `test_cleanup_called_on_failure` | stop_and_wait() called even on failure |
+| `test_missing_env_vars_raises_valueerror` | Unset MSB_SERVER_URL → ValueError (before Sandbox.create) |
+| `test_exec_timeout_raises_sandbox_execution_error` | ExecTimeoutError → SandboxExecutionError |
+| `test_pip_install_timeout_raises_sandbox_execution_error` | ExecTimeoutError during pip → SandboxExecutionError |
 
-**Key JS pattern:**
-```javascript
-const res = await fetch('/research', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({query, mode, format: 'markdown'})
-});
-const {session_id} = await res.json();
+**Mock pattern:**
+```python
+import pytest
+from unittest.mock import AsyncMock, MagicMock, patch
 
-const es = new EventSource(`/stream/${session_id}`);
-es.addEventListener('status', e => addEvent(JSON.parse(e.data)));
-es.addEventListener('result', e => renderResult(JSON.parse(e.data)));
-es.addEventListener('error', e => showError(JSON.parse(e.data)));
-es.addEventListener('done', () => { es.close(); submitBtn.disabled = false; });
+@pytest.fixture
+def mock_exec_output() -> MagicMock:
+    out = MagicMock()
+    out.exit_code = 0
+    out.success = True
+    out.stdout_text = ""
+    out.stderr_text = ""
+    return out
+
+@pytest.fixture
+def mock_sandbox(mock_exec_output: MagicMock) -> AsyncMock:
+    sb = AsyncMock()
+    sb.exec = AsyncMock(return_value=mock_exec_output)
+    sb.fs = MagicMock()
+    sb.fs.read = AsyncMock(return_value=b"fake-bytes")
+    sb.stop_and_wait = AsyncMock()
+    return sb
 ```
 
----
+### Updates to `tests/test_delivery.py` (5 new tests)
 
-## New Dependencies
+| Test | What it covers |
+|------|---------------|
+| `test_render_docx_returns_data_uri` | Mock execute_in_sandbox; output starts with correct MIME prefix |
+| `test_render_docx_base64_decodable` | Base64 portion decodes without exception |
+| `test_render_pdf_returns_data_uri` | Same for PDF MIME type |
+| `test_render_pptx_returns_data_uri` | Same for PPTX MIME type |
+| `test_render_docx_sandbox_error_propagates` | SandboxExecutionError bubbles through delivery_node |
 
-| Package | Version | Purpose |
-|---------|---------|---------|
-| `fastapi` | `>=0.109.0` | Web framework |
-| `uvicorn[standard]` | `>=0.27.0` | ASGI server |
-| `sse-starlette` | `>=2.0.0` | SSE via EventSourceResponse |
-| `python-multipart` | `>=0.0.6` | Form parsing (FastAPI requirement) |
-
-Add to `requirements.txt` under a new `# ── Web API ──` section.
-
----
-
-## Tests to Add
-
-| File | Count | What |
-|------|-------|------|
-| `tests/test_api.py` | +3 | SessionStore: create returns pending, get returns None for missing, list_expired finds old sessions |
-| `tests/test_api.py` | +2 | POST /research: returns 200 + UUID session_id; accepts research mode |
-| `tests/test_api.py` | +1 | GET / returns 200 HTML |
-| `tests/test_api.py` | +2 | GET /status: returns session state; 404 for missing session |
-| `tests/test_api.py` | +1 | GET /stream: 404 for unknown session_id |
-| `tests/test_api.py` | +4 | SSE stream events: status → result → done order; error event sets session.status |
-| `tests/test_api.py` | +2 | run_pipeline: emits correct event sequence with mocked graph |
-
-**Total: 15 new tests**
+Update 3 existing `test_output_format_*_raises_not_implemented` tests to expect success (mock execute_in_sandbox returning bytes).
 
 ---
 
 ## Failure Modes
 
-| Failure | Mitigation |
-|---------|------------|
-| Session not found | HTTP 404 on `/stream/` and `/status/` |
-| Pipeline raises exception | `run_pipeline` `try/except` emits `error` event, sets `session.status = "error"` |
-| Client disconnects mid-stream | EventSourceResponse handles disconnect gracefully; session state persists for `/status` retrieval |
-| Memory leak from old sessions | TTL cleanup (`store.cleanup_expired()`) runs on startup and every 10 min via `asyncio.create_task` |
-| Concurrent access to session state | `threading.Lock` in `SessionStore` |
-| SSE client timeout (browser ~45s default) | Client-side `EventSource` auto-reconnects; buffered `session.events` replayed so no data lost |
+| Mode | Detection | Mitigation |
+|------|-----------|------------|
+| Sandbox startup failure | MicrosandboxError from Sandbox.create() | tenacity retries 3× with backoff; reraises |
+| Package install failure | pip exit_code != 0 | Check before proceeding; SandboxExecutionError |
+| pip install timeout | ExecTimeoutError (ExecOptions.timeout=120s) | → SandboxExecutionError; not retried |
+| Code produces no output | fs.read() raises (PathNotFoundError) | → SandboxExecutionError "Output file not found" |
+| Code exec timeout | ExecTimeoutError (ExecOptions.timeout=60s) | → SandboxExecutionError; not retried |
+| Server unreachable | ConnectionError / OSError | tenacity retries 3×; reraises as MicrosandboxError |
+| Memory exhaustion | Container OOM → non-zero exit_code | Caught as code execution failure; 512MB default |
+| Cleanup skipped | Exception before finally | finally block is unconditional |
+| Data exfiltration | Outbound network call from sandbox code | `network=Network.none()` blocks all connections |
 
 ---
 
-## Cost / Performance Impact
+## Future-Proofing: LLM-Generated Code (Design Note Only)
 
-**LLM cost:** Zero change — no new LLM calls.
-
-**Memory overhead:**
-- Each `SessionState`: ~2–5 KB (event buffer strings)
-- 1-hour TTL + 10-min cleanup → at most ~360 sessions in memory
-- Worst case: ~1.8 MB
-
-**Latency:** SSE poll interval 100ms — negligible. No additional network round-trips vs CLI.
+`execute_in_sandbox()` accepts arbitrary code strings. When LLM-generated code is later passed in:
+1. `network=Network.none()` is already enforced — prevents data exfiltration
+2. Output path is fixed at `/tmp/out` — code cannot write elsewhere by convention
+3. CPU/memory/time limits enforced at container level
+4. For high-security: pre-scan code for prohibited imports (os, subprocess, socket)
+5. Log all executed code strings to LangSmith for audit trail
 
 ---
 
-## Run Commands
+## Configuration
 
-```bash
-# Install new deps
-pip install -r requirements.txt
+| Variable | Required | How used |
+|----------|----------|----------|
+| `MSB_SERVER_URL` | Yes | Read automatically by microsandbox SDK from env |
+| `MSB_API_KEY` | Yes | Read automatically by microsandbox SDK from env |
 
-# Start development server
-uvicorn api.server:app --reload --port 8000
-
-# Run all tests including new API tests
-pytest tests/ -v
-
-# Type check new API files
-mypy api/ --strict
+Add to `requirements.txt`:
 ```
+microsandbox>=0.3.14
+tenacity>=8.2
+```
+
+Constants in `agents/sandbox_runner.py`:
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `_OUTPUT_PATH` | `/tmp/out` | Fixed output file location in sandbox |
+| `_SANDBOX_IMAGE` | `python` | Base container image |
+| `_SANDBOX_CPUS` | `1` | CPU allocation |
+| `_SANDBOX_MEMORY_MB` | `512` | Memory limit (MB) |
+| `_PACKAGE_INSTALL_TIMEOUT_SECS` | `120.0` | pip install timeout via ExecOptions |
+| `_CODE_EXECUTION_TIMEOUT_SECS` | `60.0` | code exec timeout via ExecOptions |
+
+---
+
+## Token Cost Impact
+
+**Zero additional LLM calls.** All document rendering runs in containers. No change to `COST_CEILING_USD`.
+
+---
+
+## Implementation Checklist
+
+- [ ] Create `agents/sandbox_runner.py`
+- [ ] Create `tests/test_sandbox_runner.py` (9 tests)
+- [ ] Update `agents/delivery.py` — replace stubs with async renderers, add imports + helpers
+- [ ] Update `tests/test_delivery.py` — 5 new tests, update 3 existing
+- [ ] Add `microsandbox>=0.3.14` and `tenacity>=8.2` to `requirements.txt`
+- [ ] Add `MSB_SERVER_URL` and `MSB_API_KEY` to `.env.example`
+- [ ] Run `mypy agents/ --strict`
+- [ ] Run `pytest tests/ -v`

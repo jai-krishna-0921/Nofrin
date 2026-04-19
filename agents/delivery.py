@@ -552,14 +552,19 @@ async def delivery_node(
     force_delivered = _is_force_delivered(state)
 
     delivery_start(str(output_format))
+    md_text = render_markdown(synthesis, critic_output, force_delivered)
+
     if output_format == "markdown":
-        final_output = render_markdown(synthesis, critic_output, force_delivered)
+        final_output = md_text
     elif output_format == "docx":
-        final_output = await _render_docx(synthesis, critic_output, force_delivered)
+        binary_uri = await _render_docx(synthesis, critic_output, force_delivered)
+        final_output = json.dumps({"binary": binary_uri, "markdown": md_text})
     elif output_format == "pdf":
-        final_output = await _render_pdf(synthesis, critic_output, force_delivered)
+        binary_uri = await _render_pdf(synthesis, critic_output, force_delivered)
+        final_output = json.dumps({"binary": binary_uri, "markdown": md_text})
     elif output_format == "pptx":
-        final_output = await _render_pptx(synthesis, critic_output, force_delivered)
+        binary_uri = await _render_pptx(synthesis, critic_output, force_delivered)
+        final_output = json.dumps({"binary": binary_uri, "markdown": md_text})
     else:
         raise NotImplementedError(f"Unknown output_format: {output_format!r}")
 

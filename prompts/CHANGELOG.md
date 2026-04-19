@@ -58,6 +58,26 @@
 
 ---
 
+## supervisor_v3.txt
+- **Date**: 2026-04-19
+- **What**: Added `{{current_date}}` injection (today's ISO date) at top of prompt. Added STEP 2 — TEMPORAL REASONING: instructs LLM to reason about recency needs before decomposing, append year signals to time-sensitive sub-queries. Added TEMPORAL RULE to STEP 3 requiring year/recency signal in query text for time-sensitive topics (e.g., "2026", "latest", "current").
+- **Why**: System was returning stale 2024 content when queried about 2026 topics. Workers searched without year context; sub-queries had no recency signals.
+- **Eval delta**: TBD
+
+## coordinator_v2.txt
+- **Date**: 2026-04-19
+- **What**: Added `{{current_date}}` injection. Added DEPTH RULE: each finding body minimum 3 sentences with specific facts/numbers. Added RECENCY RULE: flag sources >18 months old in risks[]. Extended executive_summary to 3–4 sentences requiring most recent data points.
+- **Why**: Outputs were shallow (vague summaries) and did not flag stale sources. Date context enables the LLM to evaluate evidence recency.
+- **Eval delta**: TBD
+
+## coordinator_revision_v3.txt
+- **Date**: 2026-04-19
+- **What**: Same additions as coordinator_v2.txt (date injection, DEPTH RULE, RECENCY RULE, 3–4 sentence executive_summary) applied to the revision path. Supersedes coordinator_revision_v2.txt.
+- **Why**: Revision pass must enforce the same depth and recency standards as the first pass.
+- **Eval delta**: TBD
+
+---
+
 ## Template for new entries
 
 ```

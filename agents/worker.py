@@ -58,7 +58,7 @@ def _is_anthropic(llm: BaseChatModel) -> bool:
 
 
 logger = logging.getLogger(__name__)
-PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "worker_v1.txt"
+PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "worker_v2.txt"
 
 # Limit concurrent LLM calls to avoid Groq / OpenRouter rate-limit 429s.
 # All evidence extractions across all parallel workers share this semaphore.
@@ -88,10 +88,12 @@ class _RawEvidenceExtraction(TypedDict):
 
 
 def _build_exa_params_web(sub_query: str) -> dict[str, object]:  # noqa: ARG001
-    """Build Exa params for web: neural search, text=True, no date filter."""
+    """Build Exa params for web: neural search, text=True, 12-month recency filter."""
+    start_date = (date.today() - timedelta(days=365)).isoformat()
     return {
         "num_results": 10,
         "type": "neural",
+        "start_published_date": start_date,
         "text": True,
     }
 
@@ -262,16 +264,20 @@ def _select_provider(
     source_type: SourceType,
     research_mode: str,
     has_tavily: bool,
+    has_google: bool = False,
 ) -> str:
     """Select primary search provider based on mode and source type.
 
     Academic always uses Exa (semantic advantage).
-    Web/news use Tavily in fast mode when available, otherwise Exa.
+    Web/news: Tavily in fast mode when available; Google in research mode when
+    available (broader coverage); otherwise Exa.
     """
     if source_type == "academic":
         return "exa"
     if research_mode == "fast" and has_tavily:
         return "tavily"
+    if research_mode == "research" and has_google:
+        return "google"
     return "exa"
 
 
@@ -295,6 +301,28 @@ async def _search_tavily(
                 title=r.get("title", ""),
                 text=r.get("content") or r.get("raw_content") or "",
                 published_date=r.get("published_date"),
+            )
+        )
+    return results
+
+
+async def _search_google(api_key: str, cse_id: str, query: str) -> list[object]:
+    """Execute a Google Custom Search API request and return Exa-compatible results."""
+    async with httpx.AsyncClient() as http:
+        r = await http.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params={"key": api_key, "cx": cse_id, "q": query, "num": 10},
+            timeout=10.0,
+        )
+        r.raise_for_status()
+    results: list[object] = []
+    for item in r.json().get("items", []):
+        results.append(
+            _TavilyResult(
+                url=item.get("link", ""),
+                title=item.get("title", ""),
+                text=item.get("snippet", ""),
+                published_date=None,
             )
         )
     return results
@@ -553,16 +581,20 @@ async def worker_node(
     llm: BaseChatModel = runtime.context.llm_worker
     tavily = runtime.context.tavily_client
     brave_key = runtime.context.brave_api_key
+    google_api_key = runtime.context.google_api_key
+    google_cse_id = runtime.context.google_cse_id
+    has_google = bool(google_api_key and google_cse_id)
 
-    provider = _select_provider(source_type, research_mode, tavily is not None)
+    provider = _select_provider(source_type, research_mode, tavily is not None, has_google)
     worker_exa_search(worker_id, sub_query, str(source_type), provider)
 
     exa_results: list[object]
     try:
         if provider == "tavily" and tavily is not None:
             exa_results = await _search_tavily(tavily, sub_query, source_type)
+        elif provider == "google" and has_google:
+            exa_results = await _search_google(google_api_key, google_cse_id, sub_query)  # type: ignore[arg-type]
         else:
-            # Validate source_type for Exa before calling
             _get_exa_params(sub_query, source_type)
             exa_results = await _search_exa(exa_client, sub_query, source_type)
     except Exception as primary_err:

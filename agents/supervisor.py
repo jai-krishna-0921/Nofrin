@@ -13,6 +13,7 @@ This keeps the node fully testable and provider-agnostic.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import TypedDict
 
@@ -48,7 +49,7 @@ def _is_anthropic(llm: BaseChatModel) -> bool:
         return False
 
 
-PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "supervisor_v2.txt"
+PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "supervisor_v4.txt"
 
 _VALID_INTENT_TYPES: frozenset[str] = frozenset(
     {"exploratory", "comparative", "adversarial", "factual"}
@@ -131,6 +132,7 @@ def _build_messages(
     prompt_template: str,
     use_cache_control: bool = False,
     research_mode: str = "research",
+    current_date: str = "",
 ) -> list[BaseMessage]:
     """Build the message list for the supervisor LLM call.
 
@@ -144,6 +146,7 @@ def _build_messages(
             is returned instead.
         research_mode: "fast" or "research" — controls the num_queries_instruction
             injected into the prompt.
+        current_date: ISO date string (YYYY-MM-DD) injected into {{current_date}}.
 
     Returns:
         List containing a single SystemMessage.
@@ -159,10 +162,12 @@ def _build_messages(
         )
 
     if use_cache_control:
-        # Anthropic prompt caching: static template (with mode instruction) is cached;
+        # Anthropic prompt caching: static template (with mode + date) is cached;
         # the per-request user_query goes in a separate uncached block.
-        static_text = prompt_template.replace(
-            "{{num_queries_instruction}}", num_queries_instruction
+        static_text = (
+            prompt_template
+            .replace("{{num_queries_instruction}}", num_queries_instruction)
+            .replace("{{current_date}}", current_date)
         )
         content_blocks: list[dict[str, object]] = [
             {
@@ -180,6 +185,7 @@ def _build_messages(
     filled = (
         prompt_template
         .replace("{{num_queries_instruction}}", num_queries_instruction)
+        .replace("{{current_date}}", current_date)
         .replace("{{user_query}}", user_query)
     )
     return [SystemMessage(content=filled)]
@@ -253,6 +259,7 @@ async def _call_llm(
     user_query: str,
     llm: BaseChatModel,
     research_mode: str = "research",
+    current_date: str = "",
 ) -> SupervisorOutput:
     """Call the LLM and parse the response into a typed SupervisorOutput.
 
@@ -277,7 +284,7 @@ async def _call_llm(
         AgentParseError: After 3 failed parse/validation attempts.
     """
     prompt_template = _load_prompt()
-    messages = _build_messages(user_query, prompt_template, _is_anthropic(llm), research_mode)
+    messages = _build_messages(user_query, prompt_template, _is_anthropic(llm), research_mode, current_date)
 
     response = await llm.ainvoke(messages)
     raw: str = str(response.content)
@@ -347,7 +354,12 @@ async def supervisor_node(
 
     research_mode: str = str(state.get("research_mode", "research"))
     supervisor_start(user_query)
-    output = await _call_llm(user_query, runtime.context.llm_supervisor, research_mode)
+    output = await _call_llm(
+        user_query,
+        runtime.context.llm_supervisor,
+        research_mode,
+        current_date=date.today().isoformat(),
+    )
     sub_queries = [sq.query for sq in output.sub_queries]
     supervisor_done(str(output.intent_type), sub_queries)
 

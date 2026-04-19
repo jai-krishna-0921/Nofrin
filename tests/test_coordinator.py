@@ -941,13 +941,13 @@ def test_serialize_evidence_caps_per_item_not_mid_sentence() -> None:
     """
     # Build enough evidence items to exceed the cap.
     # Each item serializes to roughly 80-120 chars; _EVIDENCE_CHAR_CAP is 6000.
-    long_claim = "A" * 200  # 200-char claim per item, ~240 chars per serialized line
+    long_claim = "A" * 400  # 400-char claim per item, ~440 chars per serialized line
     evidences = [
         make_evidence(
             source_url=f"http://example.com/{i}",
             claim=long_claim,
         )
-        for i in range(30)  # 30 * 240 = 7200 chars, exceeds 6000
+        for i in range(50)  # 50 * 440 = 22000 chars, exceeds 12000
     ]
     wr = make_worker_result(evidences=evidences)
     output = _serialize_evidence([wr])
